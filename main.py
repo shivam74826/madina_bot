@@ -103,6 +103,9 @@ class ForexAIBot:
         logger.info("=" * 70)
         logger.info("   FOREX AI TRADING BOT - STARTING")
         logger.info(f"   Mode: {config.trading.mode.value.upper()}")
+        if config.prop_firm.enabled:
+            logger.info(f"   Prop Firm: {config.prop_firm.firm_name} ${config.prop_firm.account_size:,.0f}")
+            logger.info(f"   Phase: {config.prop_firm.current_phase}")
         logger.info(f"   Symbols: {', '.join(config.trading.symbols)}")
         logger.info(f"   Primary TF: {config.trading.primary_timeframe.value}")
         logger.info("=" * 70)
@@ -234,6 +237,17 @@ class ForexAIBot:
                     except Exception:
                         pass
 
+                    # Prop firm status
+                    pf_info = ""
+                    pf = risk.get("prop_firm", {})
+                    if pf.get("enabled"):
+                        pf_info = (
+                            f" | PF: {pf['firm']} Ph{pf['phase']} "
+                            f"DailyDD:{pf['daily_dd_pct']:.1f}%/{pf['daily_dd_buffer']:.0f}% "
+                            f"TotalDD:{pf['total_dd_pct']:.1f}%/{pf['total_dd_buffer']:.0f}% "
+                            f"Profit:{pf['profit_pct']:+.1f}%/{pf['target_pct']:.0f}%"
+                        )
+
                     logger.info(
                         f"Cycle #{self.cycle_count} | "
                         f"Time: {cycle_time:.1f}s | "
@@ -241,7 +255,7 @@ class ForexAIBot:
                         f"DD: {risk['drawdown']:.2f}% | "
                         f"Mode: {risk.get('account_mode', 'normal')} | "
                         f"Positions: {risk['open_positions']}/{risk['max_positions']} | "
-                        f"P&L: {risk['unrealized_pnl']:.2f}{upcoming_news}"
+                        f"P&L: {risk['unrealized_pnl']:.2f}{pf_info}{upcoming_news}"
                     )
 
                 # Wait before next cycle (1 minute for H1 timeframe)

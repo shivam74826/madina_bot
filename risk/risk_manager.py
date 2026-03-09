@@ -45,6 +45,11 @@ class RiskManager:
         self._last_trade_result: Dict[str, float] = {}    # Per-symbol last P&L
         self._strategy_performance: Dict[str, Dict] = {}  # Track strategy W/L
         self._account_mode = "normal"    # "micro", "small", or "normal"
+        # ─── Prop Firm Tracking ──────────────────────────────────
+        self._prop_firm_start_balance = 0.0  # Starting balance for DD calculation
+        self._prop_firm_daily_start = 0.0    # Balance at start of trading day
+        self._prop_firm_day_date = None      # Current trading day
+        self._prop_firm_halted = False       # Emergency halt flag
 
     def initialize(self):
         """
@@ -61,6 +66,40 @@ class RiskManager:
         self._last_trade_time = {}
         self._last_trade_result = {}
         self._strategy_performance = {}
+
+        # ─── Prop Firm Initialization ────────────────────────────
+        if config.prop_firm.enabled:
+            self._prop_firm_start_balance = config.prop_firm.account_size
+            self._prop_firm_daily_start = self._peak_equity
+            self._prop_firm_day_date = date.today()
+            self._prop_firm_halted = False
+            self._account_mode = "normal"  # Always normal for prop firm
+
+            phase = config.prop_firm.current_phase
+            target_pct = config.prop_firm.phase1_target if phase == 1 else config.prop_firm.phase2_target
+            target_usd = config.prop_firm.account_size * target_pct
+
+            logger.info(
+                f"═══════════════════════════════════════════════════════\n"
+                f"  PROP FIRM MODE: {config.prop_firm.firm_name}\n"
+                f"  Account Size: ${config.prop_firm.account_size:,.0f}\n"
+                f"  Current Balance: ${self._initial_balance:,.2f}\n"
+                f"  Current Equity: ${self._peak_equity:,.2f}\n"
+                f"  Phase: {phase} | Target: {target_pct:.0%} (${target_usd:,.0f})\n"
+                f"  Daily DD Limit: {config.prop_firm.daily_drawdown_limit:.0%} "
+                f"(${config.prop_firm.account_size * config.prop_firm.daily_drawdown_limit:,.0f})\n"
+                f"  Bot Daily Buffer: {config.prop_firm.daily_drawdown_buffer:.0%} "
+                f"(${config.prop_firm.account_size * config.prop_firm.daily_drawdown_buffer:,.0f})\n"
+                f"  Max DD Limit: {config.prop_firm.max_drawdown_limit:.0%} "
+                f"(${config.prop_firm.account_size * config.prop_firm.max_drawdown_limit:,.0f})\n"
+                f"  Bot DD Buffer: {config.prop_firm.max_drawdown_buffer:.0%} "
+                f"(${config.prop_firm.account_size * config.prop_firm.max_drawdown_buffer:,.0f})\n"
+                f"  Risk/Trade: {config.prop_firm.max_risk_per_trade:.2%}\n"
+                f"  Max Open Trades: {config.prop_firm.max_open_trades}\n"
+                f"  Max Lot: {config.prop_firm.max_lot_size}\n"
+                f"═══════════════════════════════════════════════════════"
+            )
+            return
 
         # ─── Auto-detect account mode from live balance ──────────
         equity = self._peak_equity
@@ -248,6 +287,17 @@ class RiskManager:
 
         if signal.stop_loss <= 0 or signal.take_profit <= 0:
             return {"approved": False, "reasons": ["REJECTED: No trade without SL and TP"]}
+
+        # ─── PROP FIRM CHECKS (highest priority) ────────────────
+        if config.prop_firm.enabled:
+            if self._prop_firm_halted:
+                return {"approved": False, "reasons": [
+                    "PROP FIRM HALTED: Account protection active — no new trades"
+                ]}
+
+            pf_ok, pf_reason = self._check_prop_firm_limits()
+            if not pf_ok:
+                return {"approved": False, "reasons": [pf_reason]}
 
         # 2. Risk/Reward ratio — adaptive minimum based on account size
         rr = signal.risk_reward
@@ -487,6 +537,143 @@ class RiskManager:
             if total >= 5:  # Need at least 5 trades for meaningful data
                 rates[name] = perf["wins"] / total
         return rates
+
+    # ─── Prop Firm Protection ────────────────────────────────────────────
+
+    def _prop_firm_daily_reset(self):
+        """Reset daily tracking at the start of each new trading day."""
+        today = date.today()
+        if self._prop_firm_day_date != today:
+            self._prop_firm_daily_start = self.connector.get_equity()
+            self._prop_firm_day_date = today
+            logger.info(
+                f"PROP FIRM | New trading day | Daily start equity: "
+                f"${self._prop_firm_daily_start:,.2f}"
+            )
+
+    def _prop_firm_daily_dd(self) -> float:
+        """Calculate current daily drawdown as fraction of starting balance."""
+        if not config.prop_firm.enabled:
+            return 0.0
+        self._prop_firm_daily_reset()
+        equity = self.connector.get_equity()
+        daily_loss = self._prop_firm_daily_start - equity
+        if daily_loss <= 0:
+            return 0.0
+        return daily_loss / config.prop_firm.account_size
+
+    def _prop_firm_total_dd(self) -> float:
+        """Calculate total drawdown from starting balance as fraction."""
+        if not config.prop_firm.enabled:
+            return 0.0
+        equity = self.connector.get_equity()
+        total_loss = config.prop_firm.account_size - equity
+        if total_loss <= 0:
+            return 0.0
+        return total_loss / config.prop_firm.account_size
+
+    def _check_prop_firm_limits(self) -> tuple:
+        """
+        Check all prop firm drawdown limits. Returns (ok, reason).
+        Uses bot safety buffers which are tighter than actual firm limits.
+        """
+        if not config.prop_firm.enabled:
+            return True, ""
+
+        # Check total drawdown against bot buffer
+        total_dd = self._prop_firm_total_dd()
+        if total_dd >= config.prop_firm.max_drawdown_buffer:
+            reason = (
+                f"PROP FIRM HALT: Total DD {total_dd:.2%} hit bot buffer "
+                f"({config.prop_firm.max_drawdown_buffer:.0%}). "
+                f"Firm limit: {config.prop_firm.max_drawdown_limit:.0%}"
+            )
+            return False, reason
+
+        # Check daily drawdown against bot buffer
+        daily_dd = self._prop_firm_daily_dd()
+        if daily_dd >= config.prop_firm.daily_drawdown_buffer:
+            reason = (
+                f"PROP FIRM PAUSE: Daily DD {daily_dd:.2%} hit bot buffer "
+                f"({config.prop_firm.daily_drawdown_buffer:.0%}). "
+                f"Firm limit: {config.prop_firm.daily_drawdown_limit:.0%}"
+            )
+            return False, reason
+
+        # Early warning at pause threshold
+        if daily_dd >= config.prop_firm.pause_at_daily_dd_pct:
+            logger.warning(
+                f"PROP FIRM WARNING: Daily DD at {daily_dd:.2%} "
+                f"({config.prop_firm.pause_at_daily_dd_pct:.0%} pause threshold)"
+            )
+
+        return True, ""
+
+    def check_prop_firm_emergency(self) -> bool:
+        """
+        Emergency check — close ALL positions if approaching firm hard limits.
+        Returns True if emergency action was taken.
+        """
+        if not config.prop_firm.enabled:
+            return False
+
+        total_dd = self._prop_firm_total_dd()
+        daily_dd = self._prop_firm_daily_dd()
+
+        # Emergency close at 6.5% total DD (firm limit is 8%)
+        if total_dd >= config.prop_firm.emergency_close_at_dd_pct:
+            logger.critical(
+                f"PROP FIRM EMERGENCY: Total DD {total_dd:.2%} — "
+                f"CLOSING ALL POSITIONS to protect account!"
+            )
+            self.order_manager.close_all_positions()
+            self._prop_firm_halted = True
+            return True
+
+        # Emergency close if daily DD approaches hard firm limit
+        if daily_dd >= config.prop_firm.daily_drawdown_limit * 0.90:
+            logger.critical(
+                f"PROP FIRM EMERGENCY: Daily DD {daily_dd:.2%} — "
+                f"90% of firm limit! CLOSING ALL POSITIONS!"
+            )
+            self.order_manager.close_all_positions()
+            self._prop_firm_halted = True
+            return True
+
+        return False
+
+    def get_prop_firm_status(self) -> Dict:
+        """Get current prop firm account status."""
+        if not config.prop_firm.enabled:
+            return {"enabled": False}
+
+        equity = self.connector.get_equity()
+        balance = self.connector.get_balance()
+        total_dd = self._prop_firm_total_dd()
+        daily_dd = self._prop_firm_daily_dd()
+        phase = config.prop_firm.current_phase
+        target_pct = config.prop_firm.phase1_target if phase == 1 else config.prop_firm.phase2_target
+        profit_pct = (equity - config.prop_firm.account_size) / config.prop_firm.account_size
+        target_remaining = target_pct - max(0, profit_pct)
+
+        return {
+            "enabled": True,
+            "firm": config.prop_firm.firm_name,
+            "account_size": config.prop_firm.account_size,
+            "balance": balance,
+            "equity": equity,
+            "phase": phase,
+            "profit_pct": round(profit_pct * 100, 2),
+            "target_pct": target_pct * 100,
+            "target_remaining_pct": round(max(0, target_remaining) * 100, 2),
+            "daily_dd_pct": round(daily_dd * 100, 2),
+            "daily_dd_limit": config.prop_firm.daily_drawdown_limit * 100,
+            "daily_dd_buffer": config.prop_firm.daily_drawdown_buffer * 100,
+            "total_dd_pct": round(total_dd * 100, 2),
+            "total_dd_limit": config.prop_firm.max_drawdown_limit * 100,
+            "total_dd_buffer": config.prop_firm.max_drawdown_buffer * 100,
+            "halted": self._prop_firm_halted,
+        }
 
     # ─── Session Filter ────────────────────────────────────────────────
 
@@ -787,6 +974,11 @@ class RiskManager:
         """
         emergency = False
 
+        # ─── Prop Firm Emergency Check (top priority) ────────────
+        if config.prop_firm.enabled:
+            if self.check_prop_firm_emergency():
+                return True
+
         # Don't trigger emergency on dead accounts (nothing to protect)
         if self._account_mode == "dead":
             return False
@@ -846,6 +1038,7 @@ class RiskManager:
             "total_trades_taken": self._total_trades_taken,
             "scaling_factor": self._get_scaling_factor() if (config.risk.scaling_enabled and self._account_mode == "normal") else 1.0,
             "strategy_performance": dict(self._strategy_performance),
+            "prop_firm": self.get_prop_firm_status(),
         }
 
     # ─── Utility ─────────────────────────────────────────────────────────

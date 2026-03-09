@@ -59,7 +59,7 @@ class TradingConfig:
     analysis_timeframes: List[TimeFrame] = field(default_factory=lambda: [
         TimeFrame.M15, TimeFrame.H1, TimeFrame.H4, TimeFrame.D1
     ])
-    max_open_trades: int = 3
+    max_open_trades: int = 2                    # 2 max for prop firm (limit exposure)
     max_trades_per_symbol: int = 1              # One trade per symbol — no stacking
     trading_hours_start: int = 1   # UTC hour (London session start)
     trading_hours_end: int = 22    # UTC hour
@@ -67,53 +67,81 @@ class TradingConfig:
 
 
 @dataclass
+class PropFirmConfig:
+    """Prop Firm Account Configuration — Goat Funded Trader $5K"""
+    enabled: bool = True                       # Enable prop firm protection mode
+    firm_name: str = "Goat Funded Trader"
+    account_size: float = 5000.0               # Starting balance
+    # ─── Prop Firm Hard Limits (DO NOT TRADE PAST THESE) ─────────
+    daily_drawdown_limit: float = 0.04         # 4% daily DD = $200 (firm rule)
+    max_drawdown_limit: float = 0.08           # 8% total DD = $400 (firm rule)
+    # ─── Bot Safety Buffers (tighter than firm limits) ───────────
+    daily_drawdown_buffer: float = 0.03        # 3% bot limit = $150 (leaves $50 buffer)
+    max_drawdown_buffer: float = 0.06          # 6% bot limit = $300 (leaves $100 buffer)
+    # ─── Profit Targets ──────────────────────────────────────────
+    phase1_target: float = 0.08               # 8% = $400
+    phase2_target: float = 0.05               # 5% = $250
+    current_phase: int = 1                    # 1 or 2
+    # ─── Prop Firm Trading Rules ─────────────────────────────────
+    min_trading_days: int = 3                 # Minimum trading days required
+    allow_weekend_holding: bool = False        # Close all before weekend
+    allow_news_trading: bool = True            # Goat Funded allows news trading
+    max_risk_per_trade: float = 0.0075         # 0.75% per trade (conservative for challenge)
+    max_open_trades: int = 2                   # Limit total exposure
+    max_lot_size: float = 0.50                 # Max lot cap for $5K
+    # ─── Emergency Shutdown ──────────────────────────────────────
+    emergency_close_at_dd_pct: float = 0.065   # Close ALL trades if DD hits 6.5%
+    pause_at_daily_dd_pct: float = 0.025       # Pause after 2.5% daily loss
+
+
+@dataclass
 class RiskConfig:
     """Risk Management Settings"""
-    max_risk_per_trade: float = 0.01       # 1% of account per trade (normal mode)
-    max_daily_risk: float = 0.03           # 3% max daily loss
-    max_drawdown: float = 0.10             # 10% max drawdown — hard stop (normal)
+    max_risk_per_trade: float = 0.0075     # 0.75% per trade (prop firm safe)
+    max_daily_risk: float = 0.03           # 3% max daily loss (buffer under 4% firm limit)
+    max_drawdown: float = 0.06             # 6% max drawdown (buffer under 8% firm limit)
     default_stop_loss_pips: float = 50.0
     default_take_profit_pips: float = 100.0
-    risk_reward_ratio: float = 1.2         # Minimum 1:1.2 R:R — relaxed for active trading
+    risk_reward_ratio: float = 1.5         # Minimum 1:1.5 R:R — prop firm needs consistency
     trailing_stop_pips: float = 30.0       # Fallback if ATR unavailable
     break_even_pips: float = 20.0          # Fallback if ATR unavailable
     trailing_stop_atr_mult: float = 1.5    # Trailing distance = ATR * this
     break_even_atr_mult: float = 1.0       # Move to BE after ATR * this in profit
     use_atr_trailing: bool = True          # Use ATR-based (True) or fixed pips (False)
-    max_lot_size: float = 1.0
+    max_lot_size: float = 0.50             # Capped for prop firm $5K
     min_lot_size: float = 0.01
     use_trailing_stop: bool = True
     use_break_even: bool = True
     # ─── Safety Limits ───────────────────────────────────────────
-    max_consecutive_losses: int = 5        # Pause trading after N consecutive losses
-    pause_after_losses_minutes: int = 120  # Pause duration after loss streak (2 hours)
-    max_spread_atr_pct: float = 0.15       # Reject trade if spread > 15% of ATR
+    max_consecutive_losses: int = 3        # Pause after 3 losses (prop firm protection)
+    pause_after_losses_minutes: int = 180  # 3 hour pause after loss streak
+    max_spread_atr_pct: float = 0.10       # Tighter spread filter (10% of ATR)
     min_tp_atr_mult: float = 1.5           # TP must be at least 1.5x ATR away
-    max_correlated_exposure: int = 2       # Max positions in correlated instruments
-    # ─── Balance-Adaptive Mode (auto-sync to live balance) ───────
-    auto_risk_scaling: bool = True          # Auto-adjust risk % based on balance
-    micro_account_threshold: float = 200.0  # Below this: micro mode (aggressive)
-    small_account_threshold: float = 500.0  # Below this: small mode (moderate)
-    micro_risk_per_trade: float = 0.05      # 5% risk for micro accounts (<$200)
-    small_risk_per_trade: float = 0.03      # 3% risk for small accounts ($200-500)
-    micro_max_drawdown: float = 0.30        # 30% DD limit for micro (gives room)
-    micro_risk_reward_ratio: float = 1.0    # Lower R:R for micro accounts
-    max_risk_at_min_lot: float = 0.25       # Max 25% risk per trade when forced to min lot (normal)
-    micro_max_risk_at_min_lot: float = 0.80  # Micro accounts: allow up to 80% risk at min lot
-    small_max_risk_at_min_lot: float = 0.50  # Small accounts: allow up to 50% risk at min lot
-    min_viable_balance: float = 1.0         # Below $1: warn but still trade
+    max_correlated_exposure: int = 1       # Only 1 position in correlated instruments
+    # ─── Balance-Adaptive Mode (disabled for prop firm) ──────────
+    auto_risk_scaling: bool = False         # Disabled — use fixed prop firm risk
+    micro_account_threshold: float = 200.0
+    small_account_threshold: float = 500.0
+    micro_risk_per_trade: float = 0.05
+    small_risk_per_trade: float = 0.03
+    micro_max_drawdown: float = 0.30
+    micro_risk_reward_ratio: float = 1.0
+    max_risk_at_min_lot: float = 0.02       # Only 2% max risk at min lot (prop firm)
+    micro_max_risk_at_min_lot: float = 0.80
+    small_max_risk_at_min_lot: float = 0.50
+    min_viable_balance: float = 1.0
     # ─── Commission & Slippage Budget ────────────────────────────
-    estimated_commission_per_lot: float = 7.0  # USD per round-trip lot (Exness gold)
-    estimated_slippage_pips: float = 1.0       # Expected slippage in pips
+    estimated_commission_per_lot: float = 7.0
+    estimated_slippage_pips: float = 1.0
     # ─── Scaling Discipline ──────────────────────────────────────
     scaling_enabled: bool = False
-    scaling_warmup_trades: int = 50            # First N trades at reduced size
-    scaling_warmup_factor: float = 0.25        # 25% size during warmup
-    scaling_proven_factor: float = 0.50        # 50% after warmup, before full
-    scaling_full_after_trades: int = 150       # Full size after this many trades
+    scaling_warmup_trades: int = 50
+    scaling_warmup_factor: float = 0.25
+    scaling_proven_factor: float = 0.50
+    scaling_full_after_trades: int = 150
     # ─── Trade Cooldown ─────────────────────────────────────────
-    cooldown_after_trade_minutes: int = 0      # Disabled
-    cooldown_after_loss_minutes: int = 0       # Disabled
+    cooldown_after_trade_minutes: int = 5      # 5 min cooldown (prevent overtrading)
+    cooldown_after_loss_minutes: int = 30      # 30 min cooldown after loss
 
 
 @dataclass
@@ -234,6 +262,7 @@ class BotConfig:
     mt5: MT5Config = field(default_factory=MT5Config)
     trading: TradingConfig = field(default_factory=TradingConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    prop_firm: PropFirmConfig = field(default_factory=PropFirmConfig)
     sessions: SessionConfig = field(default_factory=SessionConfig)
     ai: AIConfig = field(default_factory=AIConfig)
     indicators: IndicatorConfig = field(default_factory=IndicatorConfig)

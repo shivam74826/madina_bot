@@ -107,7 +107,7 @@
 
         /* === Main Layout === */
         .main-area { flex:1; display:flex; flex-direction:column; min-height:0; position:relative; }
-        #chart-container { flex:1; min-height:0; }
+        #chart-container { flex:1; min-height:200px; height:100%; }
         #rsi-container {
             height:0; overflow:hidden; border-top:1px solid var(--border);
             transition:height .25s ease; flex-shrink:0;
@@ -162,8 +162,15 @@
         .loading-overlay {
             position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
             background:rgba(15,17,23,.85); z-index:20; font-size:13px; color:var(--text-secondary);
+            flex-direction:column; gap:10px;
         }
         .loading-overlay.hidden { display:none; }
+        .loading-error { color:var(--accent-red); font-size:14px; text-align:center; max-width:400px; }
+        .loading-error .retry-btn {
+            margin-top:10px; padding:8px 20px; border-radius:6px; border:1px solid var(--accent-blue);
+            background:rgba(77,171,247,0.15); color:var(--accent-blue); cursor:pointer; font-size:13px; font-weight:600;
+        }
+        .loading-error .retry-btn:hover { background:rgba(77,171,247,0.3); }
         .spinner { width:24px; height:24px; border:3px solid var(--border); border-top-color:var(--accent-blue); border-radius:50%; animation:spin .7s linear infinite; margin-right:8px; }
         @keyframes spin { to{transform:rotate(360deg)} }
 
@@ -265,7 +272,7 @@
 
     <!-- Main chart area -->
     <div class="main-area" id="main-area">
-        <div class="loading-overlay" id="loading"><div class="spinner"></div>Loading chart data...</div>
+        <div class="loading-overlay" id="loading"><div class="spinner" id="loading-spinner"></div><div id="loading-text">Loading chart data...</div><div class="loading-error hidden" id="loading-error"></div></div>
         <div class="chart-legend" id="chart-legend">
             <div class="sym" id="legend-symbol">--</div>
             <div class="ohlc" id="legend-ohlc"><span>O: --</span><span>H: --</span><span>L: --</span><span>C: --</span></div>
@@ -382,33 +389,60 @@ function calcRSI(candles, period) {
 // =====================================================================
 //  INIT
 // =====================================================================
-async function init() {
-    var symbols = await api('/api/symbols');
-    var sel = document.getElementById('symbol-select');
-    if (symbols && Array.isArray(symbols)) {
-        sel.innerHTML = symbols.map(function(s){return '<option value="'+s+'">'+s+'</option>';}).join('');
-        var btc = symbols.find(function(s){return s.includes('BTC');});
-        if (btc) sel.value = btc;
-        currentSymbol = sel.value;
-    }
-    sel.addEventListener('change', function(){
-        currentSymbol = sel.value; lastCandleData = null; lastBid = null; loadChart();
-    });
-    document.querySelectorAll('.tf-btn').forEach(function(b){
-        b.addEventListener('click', function(){
-            document.querySelectorAll('.tf-btn').forEach(function(x){x.classList.remove('active');});
-            b.classList.add('active'); currentTF = b.dataset.tf; lastCandleData = null; loadChart();
-        });
-    });
-    document.addEventListener('keydown', function(e){
-        if (e.key==='F11'){e.preventDefault(); toggleFullscreen();}
-    });
+function showLoadingError(msg) {
+    var el = document.getElementById('loading-error');
+    var spinner = document.getElementById('loading-spinner');
+    var text = document.getElementById('loading-text');
+    if(el) { el.innerHTML = msg + '<br><button class="retry-btn" onclick="location.reload()">Retry</button>'; el.classList.remove('hidden'); }
+    if(spinner) spinner.style.display = 'none';
+    if(text) text.style.display = 'none';
+    document.getElementById('loading').classList.remove('hidden');
+}
 
-    createChart();
-    createRSIChart();
-    await loadChart();
-    startLiveTick();
-    fullRefreshTimer = setInterval(function(){loadChart(true);}, 30000);
+async function init() {
+    // Check if LightweightCharts library loaded
+    if (typeof LightweightCharts === 'undefined') {
+        showLoadingError('Failed to load charting library.<br>Check your internet connection or firewall settings.');
+        return;
+    }
+
+    try {
+        var symbols = await api('/api/symbols');
+        var sel = document.getElementById('symbol-select');
+        if (symbols && Array.isArray(symbols) && symbols.length > 0) {
+            sel.innerHTML = symbols.map(function(s){return '<option value="'+s+'">'+s+'</option>';}).join('');
+            var btc = symbols.find(function(s){return s.includes('BTC');});
+            if (btc) sel.value = btc;
+            currentSymbol = sel.value;
+        } else {
+            showLoadingError('No trading symbols configured.<br>Make sure the bot is running and connected to MT5.');
+            return;
+        }
+        sel.addEventListener('change', function(){
+            currentSymbol = sel.value; lastCandleData = null; lastBid = null; loadChart();
+        });
+        document.querySelectorAll('.tf-btn').forEach(function(b){
+            b.addEventListener('click', function(){
+                document.querySelectorAll('.tf-btn').forEach(function(x){x.classList.remove('active');});
+                b.classList.add('active'); currentTF = b.dataset.tf; lastCandleData = null; loadChart();
+            });
+        });
+        document.addEventListener('keydown', function(e){
+            if (e.key==='F11'){e.preventDefault(); toggleFullscreen();}
+        });
+
+        // Wait for layout to be fully computed before creating charts
+        await new Promise(function(resolve) { requestAnimationFrame(function() { requestAnimationFrame(resolve); }); });
+
+        createChart();
+        createRSIChart();
+        await loadChart();
+        startLiveTick();
+        fullRefreshTimer = setInterval(function(){loadChart(true);}, 30000);
+    } catch(e) {
+        console.error('Chart init error:', e);
+        showLoadingError('Chart initialization failed: ' + e.message);
+    }
 }
 
 // =====================================================================
@@ -416,8 +450,10 @@ async function init() {
 // =====================================================================
 function createChart() {
     var c = document.getElementById('chart-container');
+    var w = c.clientWidth || c.offsetWidth || 800;
+    var h = c.clientHeight || c.offsetHeight || 400;
     chart = LightweightCharts.createChart(c, {
-        width:c.clientWidth, height:c.clientHeight,
+        width:w, height:h,
         layout:{background:{type:'solid',color:'#0f1117'},textColor:'#8b8fa3',fontSize:11},
         grid:{vertLines:{color:'rgba(45,48,71,0.4)'},horzLines:{color:'rgba(45,48,71,0.4)'}},
         crosshair:{
@@ -469,14 +505,18 @@ function createChart() {
     });
 
     new ResizeObserver(function(entries){
-        for(var i=0;i<entries.length;i++) chart.applyOptions({width:entries[i].contentRect.width,height:entries[i].contentRect.height});
+        for(var i=0;i<entries.length;i++) {
+            var w=entries[i].contentRect.width, h=entries[i].contentRect.height;
+            if(w>0&&h>0) chart.applyOptions({width:w,height:h});
+        }
     }).observe(c);
 }
 
 function createRSIChart() {
     var rc = document.getElementById('rsi-container');
+    var rw = rc.clientWidth || rc.offsetWidth || 800;
     rsiChart = LightweightCharts.createChart(rc, {
-        width:rc.clientWidth, height:120,
+        width:rw, height:120,
         layout:{background:{type:'solid',color:'#0f1117'},textColor:'#8b8fa3',fontSize:10},
         grid:{vertLines:{color:'rgba(45,48,71,0.3)'},horzLines:{color:'rgba(45,48,71,0.3)'}},
         crosshair:{mode:LightweightCharts.CrosshairMode.Normal},
@@ -499,7 +539,10 @@ function createRSIChart() {
     });
 
     new ResizeObserver(function(entries){
-        for(var i=0;i<entries.length;i++) rsiChart.applyOptions({width:entries[i].contentRect.width,height:entries[i].contentRect.height});
+        for(var i=0;i<entries.length;i++) {
+            var w=entries[i].contentRect.width, h=entries[i].contentRect.height;
+            if(w>0&&h>0) rsiChart.applyOptions({width:w,height:h});
+        }
     }).observe(rc);
 }
 
@@ -507,13 +550,24 @@ function createRSIChart() {
 //  FULL CHART LOAD
 // =====================================================================
 async function loadChart(silent) {
-    if(!silent) document.getElementById('loading').classList.remove('hidden');
+    if(!silent) {
+        document.getElementById('loading').classList.remove('hidden');
+        document.getElementById('loading-spinner').style.display = '';
+        document.getElementById('loading-text').style.display = '';
+        document.getElementById('loading-error').classList.add('hidden');
+    }
     document.getElementById('legend-symbol').textContent = currentSymbol+' \u00b7 '+currentTF;
     document.getElementById('ib-sym1').textContent = currentSymbol;
     document.getElementById('ib-sym2').textContent = currentSymbol;
 
     var data = await api('/api/chart/'+currentSymbol+'?tf='+currentTF);
-    if(!data||data.error){if(!silent) document.getElementById('loading').classList.add('hidden'); return;}
+    if(!data||data.error){
+        if(!silent){
+            var errMsg = (data && data.error) ? data.error : 'Failed to fetch chart data. Check bot connection.';
+            showLoadingError(errMsg);
+        }
+        return;
+    }
 
     if(data.candles&&data.candles.length){
         candleSeries.setData(data.candles);
@@ -787,7 +841,11 @@ async function api(url){
 // =====================================================================
 //  START
 // =====================================================================
-init();
+if (document.readyState === 'complete') {
+    init();
+} else {
+    window.addEventListener('load', init);
+}
 </script>
 </body>
 </html>
