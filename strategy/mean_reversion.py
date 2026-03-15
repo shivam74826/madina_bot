@@ -42,9 +42,9 @@ class MeanReversionStrategy(BaseStrategy):
         score = 0
         reasons = []
 
-        # ─── Reject very strong trends (mean reversion fails in strong trends) ──
+        # ─── Reject trends (mean reversion only works in ranging markets) ──
         adx_val = latest["adx"]
-        if adx_val > 50:
+        if adx_val > 25:
             return self.hold_signal(symbol, f"Trend too strong for MR (ADX: {adx_val:.1f})")
 
         # ─── Bollinger Band Extremes ────────────────────────────────

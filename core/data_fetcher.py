@@ -44,12 +44,45 @@ class DataFetcher:
         # Check cache
         if use_cache and cache_key in self._cache:
             elapsed = (datetime.now() - self._cache_time[cache_key]).total_seconds()
-            if elapsed < self._cache_ttl:
-                return self._cache[cache_key].copy()
+            # Invalidate stale cache: after weekends or gaps > 2 min of TTL
+            cached_df = self._cache[cache_key]
+            stale = False
+            if elapsed >= self._cache_ttl:
+                stale = True
+            elif cached_df is not None and len(cached_df) > 0 and 'time' in cached_df.columns:
+                last_bar = cached_df['time'].iloc[-1]
+                if hasattr(last_bar, 'weekday') and last_bar.weekday() <= 4:
+                    # If today is Monday and last bar is from Friday/earlier, force refresh
+                    now = datetime.now()
+                    if now.weekday() == 0 and last_bar.weekday() == 4:
+                        stale = True
+            if not stale:
+                return cached_df.copy()
 
-        # Fetch fresh data
-        df = self.connector.get_rates(symbol, timeframe, count)
-        if df is not None:
+        # Fetch fresh data with retry
+        df = None
+        for attempt in range(3):
+            df = self.connector.get_rates(symbol, timeframe, count)
+            if df is not None:
+                break
+            import time as _time
+            _time.sleep(1 * (attempt + 1))
+
+        # Validate OHLCV data
+        if df is not None and len(df) > 0:
+            try:
+                bad_rows = (
+                    (df['high'] < df['low']) |
+                    (df['close'] > df['high']) |
+                    (df['close'] < df['low'])
+                )
+                if bad_rows.any():
+                    n_bad = bad_rows.sum()
+                    logger.warning(f"DATA QUALITY: {n_bad} bad OHLCV rows for {symbol} — dropping them")
+                    df = df[~bad_rows].reset_index(drop=True)
+            except Exception:
+                pass  # Don't break on validation failure
+
             self._cache[cache_key] = df
             self._cache_time[cache_key] = datetime.now()
 

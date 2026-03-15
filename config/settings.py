@@ -53,14 +53,14 @@ class TradingConfig:
     """Trading Parameters"""
     mode: TradingMode = TradingMode.DEMO
     symbols: List[str] = field(default_factory=lambda: [
-        "XAUUSD"
+        "XAUUSDm"
     ])
-    primary_timeframe: TimeFrame = TimeFrame.H1
+    primary_timeframe: TimeFrame = TimeFrame.M15
     analysis_timeframes: List[TimeFrame] = field(default_factory=lambda: [
-        TimeFrame.M15, TimeFrame.H1, TimeFrame.H4, TimeFrame.D1
+        TimeFrame.M5, TimeFrame.M15, TimeFrame.H1, TimeFrame.H4
     ])
     max_open_trades: int = 2                    # 2 max for prop firm (limit exposure)
-    max_trades_per_symbol: int = 1              # One trade per symbol — no stacking
+    max_trades_per_symbol: int = 2              # Allow 2 trades on same symbol (needed when trading single instrument)
     trading_hours_start: int = 1   # UTC hour (London session start)
     trading_hours_end: int = 22    # UTC hour
     magic_number: int = 123456     # Unique ID for bot's orders
@@ -105,16 +105,16 @@ class RiskConfig:
     risk_reward_ratio: float = 1.5         # Minimum 1:1.5 R:R — prop firm needs consistency
     trailing_stop_pips: float = 30.0       # Fallback if ATR unavailable
     break_even_pips: float = 20.0          # Fallback if ATR unavailable
-    trailing_stop_atr_mult: float = 1.5    # Trailing distance = ATR * this
-    break_even_atr_mult: float = 1.0       # Move to BE after ATR * this in profit
+    trailing_stop_atr_mult: float = 2.0    # Trailing distance = ATR * this (wider to let winners run)
+    break_even_atr_mult: float = 1.5       # Move to BE after ATR * 1.5 in profit (avoid noise stops)
     use_atr_trailing: bool = True          # Use ATR-based (True) or fixed pips (False)
     max_lot_size: float = 0.50             # Capped for prop firm $5K
     min_lot_size: float = 0.01
     use_trailing_stop: bool = True
     use_break_even: bool = True
     # ─── Safety Limits ───────────────────────────────────────────
-    max_consecutive_losses: int = 3        # Pause after 3 losses (prop firm protection)
-    pause_after_losses_minutes: int = 180  # 3 hour pause after loss streak
+    max_consecutive_losses: int = 5        # Pause after 5 losses (allow more attempts)
+    pause_after_losses_minutes: int = 120  # 2 hour pause after loss streak
     max_spread_atr_pct: float = 0.10       # Tighter spread filter (10% of ATR)
     min_tp_atr_mult: float = 1.5           # TP must be at least 1.5x ATR away
     max_correlated_exposure: int = 1       # Only 1 position in correlated instruments
@@ -150,7 +150,7 @@ class SessionConfig:
     # Gold (XAUUSD) optimal sessions: London open + US session
     gold_sessions: list = field(default_factory=lambda: [
         {"name": "London", "start": 7, "end": 12},
-        {"name": "US_Session", "start": 12, "end": 18},
+        {"name": "US_Session", "start": 12, "end": 21},
     ])
     # Forex major pairs
     forex_sessions: list = field(default_factory=lambda: [
@@ -158,7 +158,7 @@ class SessionConfig:
         {"name": "New_York", "start": 13, "end": 21},
     ])
     # Use session filter (False = trade all hours)
-    use_session_filter: bool = False
+    use_session_filter: bool = True
     # Higher timeframe trend confirmation
     require_htf_confirmation: bool = False
 
@@ -170,7 +170,7 @@ class AIConfig:
     prediction_horizon: int = 24           # Predict X candles ahead
     training_lookback_days: int = 90       # Historical data for training (90 days ~1500 H1 candles)
     retrain_interval_hours: int = 168      # Retrain weekly
-    min_confidence: float = 0.40           # Minimum prediction confidence (relaxed)
+    min_confidence: float = 0.45           # Minimum prediction confidence (lowered to allow signals through)
     feature_window: int = 50               # Lookback window for features
     use_sentiment: bool = True
     use_fundamentals: bool = True

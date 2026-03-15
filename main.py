@@ -48,6 +48,8 @@ from strategy.base_strategy import SignalType
 from risk.risk_manager import RiskManager
 from dashboard.app import Dashboard
 from utils.logger import setup_logging, TradeLogger
+from ai.trade_journal import TradingJournal
+from core.live_trade_manager import LiveTradeManager, C
 
 logger = logging.getLogger(__name__)
 
@@ -92,11 +94,21 @@ class ForexAIBot:
         # Logging
         self.trade_logger = TradeLogger()
 
+        # Learning system — reads past lessons and records new ones
+        self.journal = TradingJournal()
+
         # Dashboard (initialized later)
         self.dashboard = None
 
+        # Live trade manager — handles dedup, position monitoring, terminal display
+        self.live_manager = LiveTradeManager(self.connector, self.order_manager)
+
         # Track open position tickets → detect closures for circuit breaker
         self._tracked_tickets: set = set()
+
+        # Daily trade counter (reset each UTC day)
+        self._trades_today = 0
+        self._trade_count_date = None
 
     def start(self, with_dashboard: bool = True):
         """Start the trading bot."""
@@ -132,7 +144,7 @@ class ForexAIBot:
             if report["viable"]:
                 viable_symbols.append(symbol)
                 logger.info(
-                    f"  ✓ {symbol} | Min lot: {report['min_lot']} | "
+                    f"  [OK] {symbol} | Min lot: {report['min_lot']} | "
                     f"Margin: ${report['margin_for_min_lot']} | "
                     f"Risk@min: {report['risk_pct_at_min_lot']}% | "
                     f"ATR: ${report['atr']}"
@@ -140,7 +152,7 @@ class ForexAIBot:
             else:
                 effective_cap = self.risk_manager._get_effective_max_risk_at_min_lot()
                 logger.warning(
-                    f"  ✗ {symbol} | NOT VIABLE at ${report.get('equity', 0):.2f} — "
+                    f"  [X] {symbol} | NOT VIABLE at ${report.get('equity', 0):.2f} -- "
                     f"risk@min_lot: {report.get('risk_pct_at_min_lot', 'N/A')}% "
                     f"(cap: {effective_cap * 100:.0f}% in {self.risk_manager._account_mode} mode)"
                 )
@@ -161,6 +173,9 @@ class ForexAIBot:
             self.dashboard = Dashboard(self)
             self.dashboard.run(threaded=True)
 
+        # Load and display lessons from past trading
+        self.journal.log_rules()
+
         # Start trading loop
         self.running = True
         self._trading_loop()
@@ -171,6 +186,13 @@ class ForexAIBot:
         """Gracefully stop the bot."""
         logger.info("Stopping bot...")
         self.running = False
+
+        # Run end-of-day analysis and save lessons
+        try:
+            self._run_daily_analysis()
+        except Exception as e:
+            logger.error(f"Failed to run daily analysis: {e}")
+
         self.connector.disconnect()
         logger.info("Bot stopped successfully")
 
@@ -179,17 +201,33 @@ class ForexAIBot:
     def _trading_loop(self):
         """Main trading loop - runs continuously."""
         logger.info("Trading loop started")
+        self._start_time = time.time()
 
         while self.running:
             try:
                 self.cycle_count += 1
                 cycle_start = time.time()
 
-                # Check connection
+                # Log first cycle to confirm bot is alive
+                if self.cycle_count == 1:
+                    logger.info("Cycle #1 starting — bot is actively trading")
+
+                # Check connection (with circuit breaker)
                 if not self.connector.is_connected():
                     logger.warning("Lost MT5 connection, reconnecting...")
-                    if not self.connector.reconnect():
-                        time.sleep(30)
+                    reconnected = False
+                    for reconnect_attempt in range(3):
+                        if self.connector.reconnect():
+                            reconnected = True
+                            logger.info(f"Reconnected on attempt {reconnect_attempt + 1}")
+                            break
+                        time.sleep(10 * (reconnect_attempt + 1))
+                    if not reconnected:
+                        logger.critical(
+                            "CIRCUIT BREAKER: Failed to reconnect after 3 attempts. "
+                            "Halting for 5 minutes."
+                        )
+                        time.sleep(300)
                         continue
 
                 # Emergency checks
@@ -200,6 +238,29 @@ class ForexAIBot:
 
                 # Update trailing stops for open positions
                 self.order_manager.update_trailing_stops()
+
+                # Live trade management — monitor & manage open positions
+                self.live_manager.manage_positions(
+                    data_fetcher=self.data_fetcher,
+                    technical=self.technical,
+                    sentiment=self.sentiment,
+                )
+
+                # Print cycle header for terminal visibility
+                self.live_manager.print_cycle_header(self.cycle_count)
+
+                # ─── Reset daily trade counter at UTC midnight ──
+                utc_today = datetime.utcnow().date()
+                if self._trade_count_date != utc_today:
+                    self._trades_today = 0
+                    self._trade_count_date = utc_today
+                    # Run daily analysis for the previous day
+                    if self.cycle_count > 1:
+                        try:
+                            self._run_daily_analysis()
+                            self.journal.log_rules()
+                        except Exception as e:
+                            logger.error(f"Daily analysis failed: {e}")
 
                 # ─── Detect closed positions → feed circuit breaker ──
                 self._check_closed_positions()
@@ -225,7 +286,7 @@ class ForexAIBot:
 
                 # Log cycle stats
                 cycle_time = time.time() - cycle_start
-                if self.cycle_count % 10 == 0:
+                if self.cycle_count % 5 == 0:
                     risk = self.risk_manager.get_risk_summary()
                     # News summary
                     upcoming_news = ""
@@ -256,6 +317,24 @@ class ForexAIBot:
                         f"Mode: {risk.get('account_mode', 'normal')} | "
                         f"Positions: {risk['open_positions']}/{risk['max_positions']} | "
                         f"P&L: {risk['unrealized_pnl']:.2f}{pf_info}{upcoming_news}"
+                    )
+
+                    # Rich terminal position display
+                    self.live_manager.print_status(
+                        cycle_count=self.cycle_count,
+                        equity=risk['equity'],
+                        balance=risk.get('balance', risk['equity']),
+                        risk_summary=risk,
+                    )
+
+                # Heartbeat every 30 cycles (~30 min) — proves bot is alive
+                if self.cycle_count % 30 == 0:
+                    equity = self.connector.get_equity()
+                    logger.info(
+                        f"HEARTBEAT | Cycle: {self.cycle_count} | "
+                        f"Equity: ${equity:.2f} | "
+                        f"Trades today: {self._trades_today} | "
+                        f"Uptime: {(time.time() - getattr(self, '_start_time', time.time())) / 3600:.1f}h"
                     )
 
                 # Wait before next cycle (1 minute for H1 timeframe)
@@ -315,10 +394,10 @@ class ForexAIBot:
 
     def _analyze_and_trade(self, symbol: str):
         """Analyze a symbol and execute trades if conditions are met."""
-        # Throttle analysis (don't re-analyze too frequently)
+        # Throttle analysis (M15 timeframe — check every 60s)
         now = datetime.now()
         last_time = self.last_analysis_time.get(symbol)
-        if last_time and (now - last_time).total_seconds() < 30:
+        if last_time and (now - last_time).total_seconds() < 60:
             return
 
         self.last_analysis_time[symbol] = now
@@ -334,13 +413,34 @@ class ForexAIBot:
                 )
             return
 
-        # ─── News Check (informational only, does not block) ────
+        # ─── Journal: Overtrading Guard ─────────────────────────
+        if self.journal.is_overtrading(self._trades_today):
+            if self.cycle_count % 10 == 0:
+                logger.info(
+                    f"{symbol} | JOURNAL GUARD: Max trades/day reached "
+                    f"({self._trades_today}/{self.journal.get_lessons().get('max_trades_per_day', 10)})"
+                )
+            return
+
+        # ─── Journal: Bad Hour Guard ────────────────────────────
+        utc_hour = utc_now.hour
+        if self.journal.is_bad_hour(utc_hour):
+            if self.cycle_count % 10 == 0:
+                logger.info(
+                    f"{symbol} | JOURNAL GUARD: Hour {utc_hour}:00 UTC is historically "
+                    f"losing — skipping"
+                )
+            return
+
+        # ─── News Check (BLOCKS trades during high-impact news) ────
         news_size_factor = 1.0
         try:
             can_trade, news_reason, size_factor = self.news_analyzer.should_trade(symbol)
             news_size_factor = size_factor
             if not can_trade:
-                logger.info(f"{symbol} | NEWS INFO: {news_reason} (not blocking)")
+                if self.cycle_count % 10 == 0:
+                    logger.info(f"{symbol} | NEWS BLOCK: {news_reason}")
+                return  # Actually block the trade
         except Exception as e:
             logger.debug(f"News check failed for {symbol}: {e}")
 
@@ -359,6 +459,45 @@ class ForexAIBot:
         if df is None or len(df) < 200:
             return
 
+        # ─── Volume Divergence Check ─────────────────────────────
+        # Reject weak moves: price trending but volume declining
+        volume_ok = True
+        try:
+            if 'tick_volume' in df.columns and len(df) >= 20:
+                recent_vol = df['tick_volume'].iloc[-5:].mean()
+                avg_vol = df['tick_volume'].iloc[-20:].mean()
+                price_change = abs(df['close'].iloc[-1] - df['close'].iloc[-5])
+                atr_recent = df['high'].iloc[-5:].values - df['low'].iloc[-5:].values
+                avg_atr = atr_recent.mean() if len(atr_recent) > 0 else 1.0
+                # If price moved significantly but volume is declining = weak move
+                if price_change > avg_atr * 0.5 and recent_vol < avg_vol * 0.7:
+                    volume_ok = False
+                    if self.cycle_count % 10 == 0:
+                        logger.info(
+                            f"{symbol} | VOLUME DIVERGENCE: Price moving but volume "
+                            f"declining ({recent_vol:.0f} vs avg {avg_vol:.0f}) -- weak move"
+                        )
+        except Exception:
+            pass  # Volume check failed, proceed normally
+
+        # ─── RSI Divergence Check ────────────────────────────────
+        divergence_signal = None
+        try:
+            if len(df) >= 30 and 'close' in df.columns:
+                from analysis.technical import TechnicalAnalyzer
+                ta = TechnicalAnalyzer()
+                rsi_series = ta.rsi(df['close'])
+                if rsi_series is not None and len(rsi_series) >= 20:
+                    divergence_signal = self.sentiment.detect_divergence(
+                        df['close'], rsi_series, lookback=20
+                    )
+        except Exception:
+            pass
+
+        # Print market snapshot every 5 cycles for terminal visibility
+        if self.cycle_count % 5 == 0:
+            self.live_manager.print_market_snapshot(symbol, df)
+
         # Get multi-strategy signal
         signal = self.strategy_manager.get_best_signal(
             df, symbol,
@@ -373,12 +512,55 @@ class ForexAIBot:
                 logger.info(f"{symbol} | No actionable signal (HOLD) — strategies see no edge")
             return
 
+        # ─── Journal: Direction Guard ────────────────────────
+        if self.journal.should_avoid_direction(signal.signal_type.value):
+            logger.info(
+                f"{symbol} | JOURNAL GUARD: {signal.signal_type.value} direction "
+                f"recently had 0% win rate -- reducing confidence"
+            )
+            signal.confidence *= 0.85  # Mild penalty (was 0.6 — too aggressive, killed all signals)
+
+        # ─── Volume Divergence Penalty ───────────────────────
+        if not volume_ok:
+            signal.confidence *= 0.85
+            signal.reason += " | Vol divergence penalty"
+
+        # ─── RSI Divergence Boost/Penalty ────────────────────
+        if divergence_signal:
+            if (divergence_signal == "bullish_divergence" and signal.signal_type == SignalType.BUY) or \
+               (divergence_signal == "bearish_divergence" and signal.signal_type == SignalType.SELL):
+                signal.confidence *= 1.1  # Divergence confirms direction
+                signal.reason += f" | {divergence_signal} confirms"
+            elif (divergence_signal == "bullish_divergence" and signal.signal_type == SignalType.SELL) or \
+                 (divergence_signal == "bearish_divergence" and signal.signal_type == SignalType.BUY):
+                signal.confidence *= 0.85  # Divergence contradicts direction
+                signal.reason += f" | {divergence_signal} contradicts"
+
         # Validate through risk manager (basic checks only)
         validation = self.risk_manager.validate_trade(signal)
 
         if not validation["approved"]:
             logger.info(f"{symbol} | Signal rejected: {', '.join(validation['reasons'])}")
+            # Show rejected signal in terminal
+            self.live_manager.print_signal_analysis(
+                symbol, signal, approved=False,
+                reject_reasons=validation['reasons']
+            )
             return
+
+        # ─── Signal Dedup — prevent identical trades on same signal ───
+        if self.live_manager.is_duplicate_signal(
+            symbol, signal.signal_type.value,
+            signal.stop_loss, signal.take_profit
+        ):
+            logger.info(
+                f"{symbol} | DEDUP: Same {signal.signal_type.value} signal already traded "
+                f"(same SL/TP zone within 10 min) — skipping duplicate"
+            )
+            return
+
+        # Show approved signal in terminal  
+        self.live_manager.print_signal_analysis(symbol, signal, approved=True)
 
         # Calculate position size (news-aware, balance-adaptive)
         lot_size = self.risk_manager.calculate_position_size(
@@ -395,6 +577,34 @@ class ForexAIBot:
                      f"Confidence: {signal.confidence:.2f} | "
                      f"Strategy: {signal.strategy_name} | "
                      f"R:R: {signal.risk_reward:.2f}")
+
+        # Print detailed trade decision to terminal
+        self.live_manager.print_trade_decision(
+            symbol, signal, lot_size,
+            market_regime, volume_ok, divergence_signal
+        )
+
+        # ─── Live Price Validation ───────────────────────────────
+        # Reject if market price drifted too far from signal's expected entry
+        if config.trading.mode != TradingMode.PAPER:
+            try:
+                from core.mt5_lock import mt5_safe as mt5
+                tick = mt5.symbol_info_tick(symbol)
+                if tick and signal.entry_price > 0:
+                    live_price = tick.ask if signal.signal_type == SignalType.BUY else tick.bid
+                    drift = abs(live_price - signal.entry_price)
+                    # Use ATR from the data to gauge acceptable drift
+                    atr_vals = (df['high'].iloc[-14:] - df['low'].iloc[-14:]).mean()
+                    max_drift = atr_vals * 0.3
+                    if drift > max_drift:
+                        logger.warning(
+                            f"{symbol} | PRICE DRIFT: Live {live_price:.2f} vs "
+                            f"signal {signal.entry_price:.2f} (drift {drift:.2f} > "
+                            f"max {max_drift:.2f}) -- stale signal, skipping"
+                        )
+                        return
+            except Exception:
+                pass  # Proceed if tick fetch fails
 
         if config.trading.mode == TradingMode.PAPER:
             # Paper trading - just log
@@ -423,6 +633,39 @@ class ForexAIBot:
             )
 
             if result:
+                self._trades_today += 1
+                # Record signal for dedup tracking
+                self.live_manager.record_signal(
+                    symbol, signal.signal_type.value,
+                    signal.stop_loss, signal.take_profit
+                )
+                # Register position for live management
+                self.live_manager.register_position(
+                    ticket=result["ticket"],
+                    symbol=symbol,
+                    direction=signal.signal_type.value,
+                    entry_price=result["price"],
+                    sl=signal.stop_loss,
+                    tp=signal.take_profit,
+                    volume=lot_size,
+                    strategy=signal.strategy_name,
+                    confidence=signal.confidence,
+                    regime=market_regime,
+                )
+                # ─── Trade Context Logging (full decision record) ────
+                slippage = result.get("slippage", 0)
+                logger.info(
+                    f"TRADE_CONTEXT | {symbol} {signal.signal_type.value} | "
+                    f"Strategy: {signal.strategy_name} | "
+                    f"Confidence: {signal.confidence:.2f} | "
+                    f"R:R: {signal.risk_reward:.2f} | "
+                    f"Regime: {market_regime} | "
+                    f"Volume_OK: {volume_ok} | "
+                    f"Divergence: {divergence_signal} | "
+                    f"Lot: {lot_size} | "
+                    f"Slippage: {slippage:.5f} | "
+                    f"Fill: {result['price']:.5f}"
+                )
                 self.trade_logger.log_trade(
                     symbol=symbol,
                     action=signal.signal_type.value,
@@ -435,6 +678,10 @@ class ForexAIBot:
                     reason=signal.reason,
                     ticket=result["ticket"],
                     result="OPENED",
+                )
+                logger.info(
+                    f"JOURNAL: Trade #{self._trades_today} today | "
+                    f"Max: {self.journal.get_lessons().get('max_trades_per_day', 10)}"
                 )
             else:
                 logger.error(f"Failed to execute {signal.signal_type.value} on {symbol}")
@@ -472,6 +719,119 @@ class ForexAIBot:
                             f"ADAPTIVE: {weight_key} weight {old:.2f} → {new:.2f} "
                             f"(win rate: {win_rate:.0%})"
                         )
+
+    # ─── Daily Analysis & Learning ─────────────────────────────────────
+
+    def _run_daily_analysis(self):
+        """
+        Run end-of-day analysis and save lessons for tomorrow.
+        Called when bot stops or at UTC midnight.
+        """
+        from core.mt5_lock import mt5_safe as mt5
+        from datetime import timedelta
+
+        logger.info("Running daily analysis and saving lessons...")
+
+        now = datetime.now()
+        start = datetime(now.year, now.month, now.day) - timedelta(days=1)
+        deals = mt5.history_deals_get(start, now)
+
+        if not deals:
+            logger.info("No deals to analyze")
+            return
+
+        bot_deals = [d for d in deals if d.magic == config.trading.magic_number]
+        entries = [d for d in bot_deals if d.entry == 0]
+        profit_deals = [d for d in bot_deals if d.profit != 0]
+
+        if not profit_deals:
+            logger.info("No closed trades to analyze")
+            return
+
+        wins = [d for d in profit_deals if d.profit > 0]
+        losses = [d for d in profit_deals if d.profit < 0]
+        total_profit = sum(d.profit for d in profit_deals)
+        total_commission = sum(d.commission for d in profit_deals)
+        total_swap = sum(d.swap for d in profit_deals)
+
+        # Strategy performance
+        strategy_stats = {}
+        for d in profit_deals:
+            strat = d.comment.replace("AI_", "") if d.comment else "Unknown"
+            if strat not in strategy_stats:
+                strategy_stats[strat] = {"wins": 0, "losses": 0, "pnl": 0.0}
+            strategy_stats[strat]["pnl"] += d.profit
+            if d.profit > 0:
+                strategy_stats[strat]["wins"] += 1
+            else:
+                strategy_stats[strat]["losses"] += 1
+
+        # Hour performance
+        hour_stats = {}
+        for d in profit_deals:
+            entry_deal = None
+            for e in entries:
+                if e.position_id == d.position_id:
+                    entry_deal = e
+                    break
+            if entry_deal:
+                hour = datetime.fromtimestamp(entry_deal.time).hour
+            else:
+                hour = datetime.fromtimestamp(d.time).hour
+            if hour not in hour_stats:
+                hour_stats[hour] = {"wins": 0, "losses": 0, "pnl": 0.0}
+            hour_stats[hour]["pnl"] += d.profit
+            if d.profit > 0:
+                hour_stats[hour]["wins"] += 1
+            else:
+                hour_stats[hour]["losses"] += 1
+
+        # Direction performance
+        dir_stats = {"BUY": {"wins": 0, "losses": 0, "pnl": 0.0},
+                     "SELL": {"wins": 0, "losses": 0, "pnl": 0.0}}
+        for d in profit_deals:
+            entry_deal = None
+            for e in entries:
+                if e.position_id == d.position_id:
+                    entry_deal = e
+                    break
+            if entry_deal:
+                orig_side = "BUY" if entry_deal.type == 0 else "SELL"
+            else:
+                orig_side = "BUY" if d.type in [0, 2] else "SELL"
+            dir_stats[orig_side]["pnl"] += d.profit
+            if d.profit > 0:
+                dir_stats[orig_side]["wins"] += 1
+            else:
+                dir_stats[orig_side]["losses"] += 1
+
+        analysis = {
+            "date": now.strftime("%Y-%m-%d"),
+            "total_trades": len(profit_deals),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": len(wins) / len(profit_deals) * 100 if profit_deals else 0,
+            "gross_profit": round(total_profit, 2),
+            "commissions": round(total_commission, 2),
+            "net_profit": round(total_profit + total_commission + total_swap, 2),
+            "avg_win": round(sum(d.profit for d in wins) / len(wins), 2) if wins else 0,
+            "avg_loss": round(sum(d.profit for d in losses) / len(losses), 2) if losses else 0,
+            "max_streak_losses": 0,
+            "strategy_performance": {k: v for k, v in strategy_stats.items()},
+            "hour_performance": {str(k): v for k, v in hour_stats.items()},
+            "direction_performance": dir_stats,
+        }
+
+        self.journal.save_daily_summary(analysis)
+
+        logger.info(
+            f"DAILY SUMMARY: {len(profit_deals)} trades | "
+            f"W:{len(wins)} L:{len(losses)} | "
+            f"WR: {analysis['win_rate']:.0f}% | "
+            f"Net: ${analysis['net_profit']:+.2f}"
+        )
+        for rule in self.journal.get_active_rules():
+            logger.info(f"  LESSON: {rule}")
 
     # ─── AI Model Training ───────────────────────────────────────────────
 
@@ -544,6 +904,26 @@ def main():
     # Override symbols if provided
     if args.symbols:
         config.trading.symbols = args.symbols
+
+    # Auto-fix symbol names for Exness (append 'm' suffix if missing)
+    from core.mt5_lock import mt5_safe as mt5
+    if mt5.initialize():
+        fixed_symbols = []
+        for sym in config.trading.symbols:
+            info = mt5.symbol_info(sym)
+            if info is not None:
+                fixed_symbols.append(sym)
+            else:
+                # Try with 'm' suffix (Exness convention)
+                alt = sym + "m"
+                info_alt = mt5.symbol_info(alt)
+                if info_alt is not None:
+                    logger.warning(f"Symbol '{sym}' not found, using '{alt}' instead")
+                    fixed_symbols.append(alt)
+                else:
+                    logger.error(f"Symbol '{sym}' not available on this broker (tried '{alt}' too)")
+        config.trading.symbols = fixed_symbols if fixed_symbols else config.trading.symbols
+        mt5.shutdown()
 
     # Create and start bot
     bot = ForexAIBot()

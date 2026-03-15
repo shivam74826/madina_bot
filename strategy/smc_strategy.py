@@ -176,7 +176,10 @@ class SMCStrategy(BaseStrategy):
             resistances = structure.get("resistances", [])
             for res in resistances:
                 if res["price"] > entry + atr:
-                    tp = res["price"]
+                    candidate_tp = res["price"]
+                    # Only use S/R TP if it maintains minimum R:R
+                    if abs(candidate_tp - entry) / abs(entry - sl) >= config.risk.risk_reward_ratio:
+                        tp = candidate_tp
                     break
 
             confidence = min(abs(score) / 5.0, 0.85)
@@ -195,7 +198,10 @@ class SMCStrategy(BaseStrategy):
             supports = structure.get("supports", [])
             for sup in supports:
                 if sup["price"] < entry - atr:
-                    tp = sup["price"]
+                    candidate_tp = sup["price"]
+                    # Only use S/R TP if it maintains minimum R:R
+                    if abs(entry - candidate_tp) / abs(sl - entry) >= config.risk.risk_reward_ratio:
+                        tp = candidate_tp
                     break
 
             confidence = min(abs(score) / 5.0, 0.85)

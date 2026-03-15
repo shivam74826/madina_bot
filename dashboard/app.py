@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from flask import Flask, render_template, jsonify, request
 import logging
 import threading
-import MetaTrader5 as mt5
+from core.mt5_lock import mt5_safe as mt5
 
 from config.settings import config
 

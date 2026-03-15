@@ -289,11 +289,11 @@ class MultiStrategyManager:
             )
 
         # ─── Minimum Consensus Gate ──────────────────────────────────
-        # Allow single strategy signals
+        # Require at least 2 strategies to agree (was 60% = 3/5 which was too strict)
         agreement_count = len(aligned_signals)
         total_strategies = len(signals)
 
-        MIN_CONSENSUS = 1  # Allow single strategy trades
+        MIN_CONSENSUS = 2  # 2 out of 5 — reasonable bar without signal drought
         if agreement_count < MIN_CONSENSUS:
             strategy_names = ", ".join(aligned_signals.keys())
             return TradeSignal(
@@ -301,7 +301,7 @@ class MultiStrategyManager:
                 confidence=0, entry_price=0, stop_loss=0, take_profit=0,
                 reason=(
                     f"Weak consensus ({agreement_count}/{total_strategies}): "
-                    f"{strategy_names} — need ≥{MIN_CONSENSUS} to trade"
+                    f"{strategy_names} -- need {MIN_CONSENSUS}+ to trade"
                 ),
                 strategy_name="Multi_Strategy",
             )
@@ -317,15 +317,15 @@ class MultiStrategyManager:
         )
         best_signal = aligned_signals[best_name]
 
-        # ─── Consensus confidence (only penalise, never boost) ───────
+        # ─── Consensus confidence (reward agreement, penalise weak) ───
         agreement_ratio = agreement_count / total_strategies if total_strategies > 0 else 0
 
-        if agreement_ratio >= 0.6:
-            confidence_factor = 1.0   # Full confidence — no boost
-        elif agreement_ratio >= 0.4:
-            confidence_factor = 1.0   # No penalty
+        if agreement_ratio >= 0.8:
+            confidence_factor = 1.1   # 4-5/5 agree — strong boost
+        elif agreement_ratio >= 0.6:
+            confidence_factor = 1.05  # 3/5 agree — small boost
         else:
-            confidence_factor = 1.0   # No penalty — single strategy allowed
+            confidence_factor = 1.0   # 2/5 agree — neutral (MIN_CONSENSUS=2 so this is valid)
 
         final_confidence = min(best_signal.confidence * confidence_factor, 0.95)
 

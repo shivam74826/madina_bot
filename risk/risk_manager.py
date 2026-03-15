@@ -13,7 +13,7 @@ Comprehensive risk management system that protects the trading account:
 =============================================================================
 """
 
-import MetaTrader5 as mt5
+from core.mt5_lock import mt5_safe as mt5
 import pandas as pd
 import numpy as np
 from datetime import datetime, date, timedelta
@@ -80,7 +80,7 @@ class RiskManager:
             target_usd = config.prop_firm.account_size * target_pct
 
             logger.info(
-                f"═══════════════════════════════════════════════════════\n"
+                f"=======================================================\n"
                 f"  PROP FIRM MODE: {config.prop_firm.firm_name}\n"
                 f"  Account Size: ${config.prop_firm.account_size:,.0f}\n"
                 f"  Current Balance: ${self._initial_balance:,.2f}\n"
@@ -97,7 +97,7 @@ class RiskManager:
                 f"  Risk/Trade: {config.prop_firm.max_risk_per_trade:.2%}\n"
                 f"  Max Open Trades: {config.prop_firm.max_open_trades}\n"
                 f"  Max Lot: {config.prop_firm.max_lot_size}\n"
-                f"═══════════════════════════════════════════════════════"
+                f"======================================================="
             )
             return
 
@@ -174,7 +174,19 @@ class RiskManager:
         return config.risk.max_risk_at_min_lot              # 25%
 
     def is_account_viable(self) -> bool:
-        """Always returns True — bot will always attempt to trade."""
+        """Check if equity is above the bankruptcy floor. Protects the prop firm account."""
+        equity = self.connector.get_equity()
+        # Equity floor = 20% below prop firm starting balance (absolute minimum)
+        if config.prop_firm.enabled:
+            floor = config.prop_firm.account_size * (1.0 - config.prop_firm.max_drawdown_limit)
+        else:
+            floor = self._initial_balance * 0.80  # 80% of starting balance
+        if equity < floor:
+            logger.critical(
+                f"EQUITY FLOOR BREACH: ${equity:.2f} < ${floor:.2f} — "
+                f"ALL TRADING HALTED to protect account"
+            )
+            return False
         return True
 
     def assess_symbol_viability(self, symbol: str) -> Dict:
@@ -278,6 +290,12 @@ class RiskManager:
         reasons = []
         approved = True
 
+        # 0. Equity floor — absolute bankruptcy protection
+        if not self.is_account_viable():
+            return {"approved": False, "reasons": [
+                "EQUITY FLOOR: Account below minimum viable equity — no new trades"
+            ]}
+
         # 1. Signal validity — EVERY trade MUST have SL and TP
         if not signal.is_valid():
             return {"approved": False, "reasons": ["Invalid signal data (missing SL/TP)"]}
@@ -367,6 +385,11 @@ class RiskManager:
             approved = False
             reasons.append("Outside trading hours")
 
+        # 8b. Session filter (gold = London + US only)
+        if not self._is_optimal_session(signal.symbol):
+            approved = False
+            reasons.append("Outside optimal trading session for this instrument")
+
         # 9. Confidence check (slightly relaxed for micro accounts)
         min_conf = config.ai.min_confidence
         if self._account_mode == "micro":
@@ -410,16 +433,36 @@ class RiskManager:
         sl_distance = abs(signal.entry_price - signal.stop_loss)
         sl_pips = self._price_to_pips(signal.symbol, sl_distance)
 
+        # ─── Slippage Budget: widen effective SL for sizing ──────
+        sl_pips += config.risk.estimated_slippage_pips
+
         if sl_pips <= 0:
             logger.warning(f"Invalid SL pips for {signal.symbol}, using minimum lot")
             return config.risk.min_lot_size
 
+        # Use BALANCE for sizing (stable), equity only for DD checks
+        balance = self.connector.get_balance()
         equity = self.connector.get_equity()
+        sizing_base = balance if balance > 0 else equity
         eff_risk = self._get_effective_risk_pct()
 
-        # Calculate base lot size using effective (adaptive) risk %
+        # ─── Dynamic Risk Scaling (reduce when in drawdown) ──────
+        dd = self._current_drawdown()
+        eff_dd = self._get_effective_max_drawdown()
+        if dd > 0 and eff_dd > 0:
+            # Linear reduction: at 50% of max DD, risk drops to 50%
+            dd_ratio = dd / eff_dd
+            if dd_ratio > 0.3:
+                risk_multiplier = max(0.25, 1.0 - dd_ratio)
+                eff_risk *= risk_multiplier
+                logger.info(
+                    f"DYNAMIC RISK: DD at {dd:.2%} ({dd_ratio:.0%} of max) "
+                    f"-- risk reduced to {eff_risk:.3%}"
+                )
+
+        # Calculate base lot size using BALANCE (not equity) for stable sizing
         base = self.order_manager.calculate_lot_size(
-            signal.symbol, sl_pips, eff_risk
+            signal.symbol, sl_pips, eff_risk, use_balance=True
         )
 
         # Commission deduction — only for accounts where it's meaningful
@@ -427,7 +470,7 @@ class RiskManager:
         if self._account_mode == "normal":
             commission_cost = config.risk.estimated_commission_per_lot
             if base > 0 and commission_cost > 0:
-                gross_risk = equity * eff_risk
+                gross_risk = sizing_base * eff_risk
                 net_risk = gross_risk - (commission_cost * base)
                 if net_risk > 0:
                     adjustment = net_risk / gross_risk
@@ -445,12 +488,7 @@ class RiskManager:
             base *= 0.5
             logger.info(f"Position at 50%: {self._consecutive_losses} consecutive losses")
 
-        # 3. Drawdown-based reduction
-        dd = self._current_drawdown()
-        eff_dd = self._get_effective_max_drawdown()
-        if dd > eff_dd * 0.7:  # Above 70% of effective max DD
-            base *= 0.5
-            logger.info(f"Position halved: drawdown at {dd:.2%}")
+        # 3. Drawdown-based reduction is now handled above via dynamic risk scaling
 
         # NO confidence scaling — removed
 
@@ -488,10 +526,11 @@ class RiskManager:
         # Clamp to limits
         base = max(actual_min_lot, min(base, config.risk.max_lot_size))
 
-        # Round to volume step
+        # Round to volume step (floor to avoid oversizing)
         if sym_info:
             step = sym_info.volume_step
-            base = round(base / step) * step
+            import math
+            base = math.floor(base / step) * step
 
         return round(base, 2)
 
@@ -973,6 +1012,12 @@ class RiskManager:
         Uses adaptive drawdown limit based on account size.
         """
         emergency = False
+
+        # ─── Equity Floor Check ──────────────────────────────────
+        if not self.is_account_viable():
+            logger.critical("EMERGENCY: Equity below bankruptcy floor! Closing all positions!")
+            self.order_manager.close_all_positions()
+            return True
 
         # ─── Prop Firm Emergency Check (top priority) ────────────
         if config.prop_firm.enabled:

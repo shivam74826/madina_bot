@@ -160,14 +160,31 @@ class AIPredictor:
         self.test_accuracy = accuracy_score(y_test, test_pred)
 
         # Walk-forward validation for realistic accuracy estimate
-        wf_accuracy = self._walk_forward_validate(df, horizon, n_splits=3)
+        wf_accuracy = self._walk_forward_validate(df, horizon, n_splits=5)
         self.walk_forward_accuracy = wf_accuracy
 
-        # Calibrate confidence based on validation performance
-        # If model barely beats random (33% for 3 classes), reduce confidence
+        # Walk-forward accuracy gating: reject model if WF is much worse than test
         random_baseline = 1.0 / len(np.unique(y_train))
-        excess_accuracy = max(self.test_accuracy - random_baseline, 0)
-        self.confidence_calibration = min(excess_accuracy * 3.0, 1.0)  # Scale 0-1
+        if wf_accuracy < random_baseline + 0.02:
+            logger.warning(
+                f"MODEL REJECTED: Walk-forward accuracy {wf_accuracy:.4f} barely beats "
+                f"random ({random_baseline:.4f}). Model will NOT be used."
+            )
+            self.is_trained = False
+            return {"status": "rejected", "reason": "walk_forward_too_low",
+                    "wf_accuracy": wf_accuracy, "random_baseline": random_baseline}
+
+        if wf_accuracy < self.test_accuracy - 0.10:
+            logger.warning(
+                f"MODEL SUSPECT: Walk-forward {wf_accuracy:.4f} is {self.test_accuracy - wf_accuracy:.4f} "
+                f"below test accuracy {self.test_accuracy:.4f} -- likely overfitting. "
+                f"Confidence will be heavily penalized."
+            )
+            self.confidence_calibration = 0.5  # Heavy penalty
+        else:
+            # Calibrate confidence based on validation performance
+            excess_accuracy = max(self.test_accuracy - random_baseline, 0)
+            self.confidence_calibration = min(excess_accuracy * 3.0, 1.0)
 
         self.is_trained = True
         self.last_trained = datetime.now()

@@ -7,13 +7,14 @@ positions, and managing trailing stops with MetaTrader 5.
 =============================================================================
 """
 
-import MetaTrader5 as mt5
+from core.mt5_lock import mt5_safe as mt5
 import numpy as np
 import logging
 from typing import Optional, Dict, Tuple
 from datetime import datetime
 
 from config.settings import config, TimeFrame
+from utils.email_notifier import notifier
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,8 @@ class OrderManager:
     def __init__(self, connector):
         self.connector = connector
         self.trade_log = []
+        # Track tickets that already had partial TP taken
+        self._partial_tp_taken: set = set()
 
     def _get_filling_mode(self, symbol: str) -> int:
         """Get the correct filling mode for a symbol."""
@@ -47,7 +50,7 @@ class OrderManager:
         sl: float = 0.0,
         tp: float = 0.0,
         comment: str = "AI_Bot",
-        deviation: int = 20,
+        deviation: int = None,
     ) -> Optional[Dict]:
         """
         Place a market order (instant execution).
@@ -59,7 +62,7 @@ class OrderManager:
             sl: Stop loss price (0 = no SL)
             tp: Take profit price (0 = no TP)
             comment: Order comment
-            deviation: Max price deviation in points
+            deviation: Max price deviation in points (None = ATR-based)
             
         Returns:
             Order result dict or None if failed
@@ -86,6 +89,17 @@ class OrderManager:
             logger.error(f"Invalid order type: {order_type}")
             return None
 
+        # ATR-based deviation (points) — prevents accepting terrible fills
+        if deviation is None:
+            try:
+                atr = self._get_atr(symbol)
+                sym_info = mt5.symbol_info(symbol)
+                point = sym_info.point if sym_info else 0.01
+                # Deviation = half ATR in points, min 10 max 50
+                deviation = max(10, min(50, int(atr / (2 * point)))) if point > 0 else 20
+            except Exception:
+                deviation = 20
+
         # Build request
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -102,16 +116,68 @@ class OrderManager:
             "type_filling": self._get_filling_mode(symbol),
         }
 
-        # Send order
-        result = mt5.order_send(request)
+        # ─── SL/TP Sanity Check ────────────────────────────────
+        if sl > 0:
+            if order_type.upper() == "BUY" and sl >= price:
+                logger.error(f"Invalid SL for BUY: SL {sl} >= entry {price}")
+                return None
+            if order_type.upper() == "SELL" and sl <= price:
+                logger.error(f"Invalid SL for SELL: SL {sl} <= entry {price}")
+                return None
+        if tp > 0:
+            if order_type.upper() == "BUY" and tp <= price:
+                logger.error(f"Invalid TP for BUY: TP {tp} <= entry {price}")
+                return None
+            if order_type.upper() == "SELL" and tp >= price:
+                logger.error(f"Invalid TP for SELL: TP {tp} >= entry {price}")
+                return None
+
+        # ─── Send order with retry logic ─────────────────────────
+        import time as _time
+        result = None
+        last_error = None
+        for attempt in range(3):
+            result = mt5.order_send(request)
+            if result is None:
+                last_error = mt5.last_error()
+                logger.warning(f"Order attempt {attempt+1}/3 failed: {last_error}")
+                _time.sleep(0.5 * (attempt + 1))
+                # Refresh price before retry
+                tick = mt5.symbol_info_tick(symbol)
+                if tick:
+                    request["price"] = tick.ask if order_type.upper() == "BUY" else tick.bid
+                continue
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                break
+            # Retryable error codes: requote, price changed, timeout
+            if result.retcode in (10004, 10006, 10007, 10014, 10021):
+                logger.warning(f"Order attempt {attempt+1}/3 retryable | Code: {result.retcode} | {result.comment}")
+                _time.sleep(0.5 * (attempt + 1))
+                tick = mt5.symbol_info_tick(symbol)
+                if tick:
+                    request["price"] = tick.ask if order_type.upper() == "BUY" else tick.bid
+                continue
+            else:
+                # Non-retryable error
+                break
+
         if result is None:
-            logger.error(f"Order send failed: {mt5.last_error()}")
+            logger.error(f"Order send failed after 3 attempts: {last_error}")
             return None
 
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             logger.error(f"Order failed | Code: {result.retcode} | "
                          f"Comment: {result.comment}")
             return None
+
+        # ─── Slippage Tracking ───────────────────────────────────
+        requested_price = price
+        filled_price = result.price
+        slippage_points = abs(filled_price - requested_price)
+        if slippage_points > 0:
+            logger.info(f"SLIPPAGE | {symbol} {order_type} | "
+                        f"Requested: {requested_price:.5f} | Filled: {filled_price:.5f} | "
+                        f"Slip: {slippage_points:.5f} points")
 
         order_result = {
             "ticket": result.order,
@@ -120,6 +186,8 @@ class OrderManager:
             "type": order_type,
             "volume": volume,
             "price": result.price,
+            "requested_price": requested_price,
+            "slippage": slippage_points,
             "sl": sl,
             "tp": tp,
             "comment": comment,
@@ -129,6 +197,7 @@ class OrderManager:
         self.trade_log.append(order_result)
         logger.info(f"ORDER PLACED | {order_type} {volume} {symbol} @ {result.price} | "
                      f"SL: {sl} | TP: {tp} | Ticket: {result.order}")
+        notifier.notify_trade_opened(order_result)
         return order_result
 
     def place_pending_order(
@@ -223,6 +292,8 @@ class OrderManager:
             return False
 
         logger.info(f"MODIFIED | Ticket: {ticket} | SL: {new_sl} | TP: {new_tp}")
+        if sl is not None and sl != pos.sl:
+            notifier.notify_sl_modified(pos.symbol, ticket, pos.sl, new_sl)
         return True
 
     # ─── Close Positions ─────────────────────────────────────────────────
@@ -269,6 +340,9 @@ class OrderManager:
 
         logger.info(f"CLOSED | Ticket: {ticket} | {pos.symbol} | "
                      f"Profit: {pos.profit}")
+        direction = "BUY" if pos.type == mt5.ORDER_TYPE_BUY else "SELL"
+        notifier.notify_trade_closed(pos.symbol, direction, ticket, pos.profit,
+                                     close_price=price, comment=comment)
         return True
 
     def close_all_positions(self, symbol: str = None) -> int:
@@ -285,6 +359,69 @@ class OrderManager:
         logger.info(f"Closed {closed}/{len(positions)} positions")
         return closed
 
+    def partial_close(self, ticket: int, fraction: float = 0.5,
+                      comment: str = "AI_PartialTP") -> bool:
+        """
+        Close a fraction of a position (e.g. 50% at 1R profit).
+        Returns True if partial close succeeded.
+        """
+        position = mt5.positions_get(ticket=ticket)
+        if position is None or len(position) == 0:
+            return False
+
+        pos = position[0]
+        sym_info = mt5.symbol_info(pos.symbol)
+        if sym_info is None:
+            return False
+
+        close_volume = pos.volume * fraction
+        # Round down to volume step
+        step = sym_info.volume_step
+        close_volume = int(close_volume / step) * step
+        close_volume = round(close_volume, 2)
+
+        if close_volume < sym_info.volume_min:
+            return False  # Too small to partial close
+
+        tick = mt5.symbol_info_tick(pos.symbol)
+        if tick is None:
+            return False
+
+        if pos.type == mt5.ORDER_TYPE_BUY:
+            close_type = mt5.ORDER_TYPE_SELL
+            price = tick.bid
+        else:
+            close_type = mt5.ORDER_TYPE_BUY
+            price = tick.ask
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": pos.symbol,
+            "volume": close_volume,
+            "type": close_type,
+            "position": ticket,
+            "price": price,
+            "deviation": 20,
+            "magic": config.trading.magic_number,
+            "comment": comment,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": self._get_filling_mode(pos.symbol),
+        }
+
+        result = mt5.order_send(request)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            error = result.comment if result else mt5.last_error()
+            logger.error(f"Partial close {ticket} failed: {error}")
+            return False
+
+        logger.info(
+            f"PARTIAL TP | {pos.symbol} #{ticket} | "
+            f"Closed {close_volume} of {pos.volume} lots | "
+            f"Profit locked: {pos.profit * fraction:.2f}"
+        )
+        notifier.notify_partial_close(pos.symbol, ticket, fraction, pos.profit * fraction)
+        return True
+
     # ─── Trailing Stop Management ────────────────────────────────────────
 
     def update_trailing_stops(self):
@@ -298,7 +435,7 @@ class OrderManager:
 
     def _get_atr(self, symbol: str, period: int = 14) -> float:
         """
-        Calculate current ATR for a symbol using H1 candles.
+        Calculate current ATR for a symbol using M15 candles (matches primary TF).
         Returns ATR in price units, or 0.0 on failure.
         """
         try:
@@ -306,7 +443,7 @@ class OrderManager:
             tf_map = {
                 TimeFrame.H1: mt5.TIMEFRAME_H1,
             }
-            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 0, period + 5)
+            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, period + 5)
             if rates is None or len(rates) < period:
                 return 0.0
             highs = np.array([r[2] for r in rates])   # high
@@ -328,8 +465,10 @@ class OrderManager:
     def _apply_trailing_stop(self, position: Dict):
         """
         Apply trailing stop logic to a single position.
-        Uses ATR-based distances so it adapts to each instrument's volatility
-        (e.g., gold vs forex pairs).
+        Includes:
+        - Partial TP: close 50% at 1R profit, move SL to break-even
+        - Chandelier trailing: trail from highest high / lowest low minus ATR
+        - ATR-based fallback distances
         """
         symbol = position["symbol"]
         tick = mt5.symbol_info_tick(symbol)
@@ -338,6 +477,7 @@ class OrderManager:
             return
 
         point = sym_info.point
+        ticket = position["ticket"]
 
         # ── Compute distances: ATR-based or fixed-pip fallback ──
         if config.risk.use_atr_trailing:
@@ -346,56 +486,97 @@ class OrderManager:
                 trail_distance = atr * config.risk.trailing_stop_atr_mult
                 be_distance = atr * config.risk.break_even_atr_mult
             else:
-                # ATR unavailable — fall back to fixed pips
                 trail_distance = config.risk.trailing_stop_pips * point * 10
                 be_distance = config.risk.break_even_pips * point * 10
         else:
             trail_distance = config.risk.trailing_stop_pips * point * 10
             be_distance = config.risk.break_even_pips * point * 10
 
+        # ── Compute 1R distance (SL distance from entry) ──
+        sl_distance = abs(position["price_open"] - position["sl"]) if position["sl"] > 0 else be_distance
+
+        # ── Chandelier stop: use recent highs/lows for tighter trailing ──
+        chandelier_sl = None
+        try:
+            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 20)
+            if rates is not None and len(rates) >= 10:
+                highs = [r[2] for r in rates[-10:]]
+                lows = [r[3] for r in rates[-10:]]
+                if position["type"] == "BUY":
+                    chandelier_sl = max(highs) - trail_distance
+                else:
+                    chandelier_sl = min(lows) + trail_distance
+        except Exception:
+            pass
+
         if position["type"] == "BUY":
             current_price = tick.bid
             profit_distance = current_price - position["price_open"]
 
-            # Break even
-            if config.risk.use_break_even and profit_distance >= be_distance:
-                if position["sl"] < position["price_open"]:
-                    new_sl = position["price_open"] + point  # Small buffer
-                    logger.info(
-                        f"BREAK-EVEN | {symbol} BUY #{position['ticket']} | "
-                        f"ATR-based BE distance: {be_distance:.2f} | "
-                        f"Profit: {profit_distance:.2f} | New SL: {new_sl:.5f}"
-                    )
-                    self.modify_position(position["ticket"], sl=new_sl)
+            # ── Partial TP at 1R ──
+            if ticket not in self._partial_tp_taken and profit_distance >= sl_distance and sl_distance > 0:
+                if self.partial_close(ticket, fraction=0.5, comment="AI_PartialTP_1R"):
+                    self._partial_tp_taken.add(ticket)
+                    # Move SL to break-even on remaining
+                    new_sl = position["price_open"] + point
+                    self.modify_position(ticket, sl=new_sl)
+                    logger.info(f"PARTIAL TP + BE | BUY #{ticket} | 1R reached ({sl_distance:.2f})")
                     return
 
-            # Trailing stop
+            # ── Break even ──
+            if config.risk.use_break_even and profit_distance >= be_distance:
+                if position["sl"] < position["price_open"]:
+                    new_sl = position["price_open"] + point
+                    logger.info(
+                        f"BREAK-EVEN | {symbol} BUY #{ticket} | "
+                        f"Profit: {profit_distance:.2f} | New SL: {new_sl:.5f}"
+                    )
+                    self.modify_position(ticket, sl=new_sl)
+                    return
+
+            # ── Chandelier + ATR trailing (use the tighter of the two) ──
             if profit_distance >= trail_distance:
-                new_sl = current_price - trail_distance
+                atr_sl = current_price - trail_distance
+                candidates = [atr_sl]
+                if chandelier_sl is not None and chandelier_sl > position["price_open"]:
+                    candidates.append(chandelier_sl)
+                new_sl = max(candidates)  # Pick the tighter (higher) SL
                 if new_sl > position["sl"]:
-                    self.modify_position(position["ticket"], sl=new_sl)
+                    self.modify_position(ticket, sl=new_sl)
 
         elif position["type"] == "SELL":
             current_price = tick.ask
             profit_distance = position["price_open"] - current_price
 
-            # Break even
+            # ── Partial TP at 1R ──
+            if ticket not in self._partial_tp_taken and profit_distance >= sl_distance and sl_distance > 0:
+                if self.partial_close(ticket, fraction=0.5, comment="AI_PartialTP_1R"):
+                    self._partial_tp_taken.add(ticket)
+                    new_sl = position["price_open"] - point
+                    self.modify_position(ticket, sl=new_sl)
+                    logger.info(f"PARTIAL TP + BE | SELL #{ticket} | 1R reached ({sl_distance:.2f})")
+                    return
+
+            # ── Break even ──
             if config.risk.use_break_even and profit_distance >= be_distance:
                 if position["sl"] > position["price_open"] or position["sl"] == 0:
                     new_sl = position["price_open"] - point
                     logger.info(
-                        f"BREAK-EVEN | {symbol} SELL #{position['ticket']} | "
-                        f"ATR-based BE distance: {be_distance:.2f} | "
+                        f"BREAK-EVEN | {symbol} SELL #{ticket} | "
                         f"Profit: {profit_distance:.2f} | New SL: {new_sl:.5f}"
                     )
-                    self.modify_position(position["ticket"], sl=new_sl)
+                    self.modify_position(ticket, sl=new_sl)
                     return
 
-            # Trailing stop
+            # ── Chandelier + ATR trailing ──
             if profit_distance >= trail_distance:
-                new_sl = current_price + trail_distance
+                atr_sl = current_price + trail_distance
+                candidates = [atr_sl]
+                if chandelier_sl is not None and chandelier_sl < position["price_open"]:
+                    candidates.append(chandelier_sl)
+                new_sl = min(candidates)  # Pick the tighter (lower) SL
                 if position["sl"] == 0 or new_sl < position["sl"]:
-                    self.modify_position(position["ticket"], sl=new_sl)
+                    self.modify_position(ticket, sl=new_sl)
 
     # ─── Utility Methods ─────────────────────────────────────────────────
 
@@ -404,6 +585,7 @@ class OrderManager:
         symbol: str,
         sl_pips: float,
         risk_percent: float = None,
+        use_balance: bool = False,
     ) -> float:
         """
         Calculate optimal lot size based on risk management.
@@ -412,6 +594,7 @@ class OrderManager:
             symbol: Trading symbol
             sl_pips: Stop loss distance in pips
             risk_percent: Risk percentage (defaults to config)
+            use_balance: If True, size from balance (stable); False = equity
             
         Returns:
             Calculated lot size, clamped to min/max limits
@@ -419,11 +602,16 @@ class OrderManager:
         if risk_percent is None:
             risk_percent = config.risk.max_risk_per_trade
 
-        # Use equity (not balance) — reflects real-time account state with open P&L
-        equity = self.connector.get_equity()
-        if equity <= 0:
-            equity = self.connector.get_balance()  # Fallback to balance
-        risk_amount = equity * risk_percent
+        # Use balance for stable sizing (institutional standard)
+        if use_balance:
+            sizing_base = self.connector.get_balance()
+            if sizing_base <= 0:
+                sizing_base = self.connector.get_equity()
+        else:
+            sizing_base = self.connector.get_equity()
+            if sizing_base <= 0:
+                sizing_base = self.connector.get_balance()
+        risk_amount = sizing_base * risk_percent
 
         sym_info = mt5.symbol_info(symbol)
         if sym_info is None:

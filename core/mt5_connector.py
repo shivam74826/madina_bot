@@ -7,7 +7,7 @@ Provides methods for account info, symbol data, and market data retrieval.
 =============================================================================
 """
 
-import MetaTrader5 as mt5
+from core.mt5_lock import mt5_safe as mt5
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
