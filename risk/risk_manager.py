@@ -306,6 +306,28 @@ class RiskManager:
         if signal.stop_loss <= 0 or signal.take_profit <= 0:
             return {"approved": False, "reasons": ["REJECTED: No trade without SL and TP"]}
 
+        # ─── MAX SL DISTANCE CHECK (micro account protection) ───
+        # Reject trades where SL is too wide for the account
+        sl_distance = abs(signal.entry_price - signal.stop_loss)
+        equity = self.connector.get_equity()
+        if equity > 0 and sl_distance > 0:
+            sl_pips = self._price_to_pips(signal.symbol, sl_distance)
+            try:
+                from core.mt5_lock import mt5_safe as _mt5
+                _sym = _mt5.symbol_info(signal.symbol)
+                if _sym:
+                    tick_val = _sym.trade_tick_value
+                    min_lot = _sym.volume_min
+                    actual_risk = sl_pips * tick_val * 10 * min_lot
+                    max_acceptable = equity * self._get_effective_max_risk_at_min_lot()
+                    if actual_risk > max_acceptable:
+                        return {"approved": False, "reasons": [
+                            f"SL too wide: ${actual_risk:.2f} risk > ${max_acceptable:.2f} limit "
+                            f"(SL dist: {sl_distance:.2f}, equity: ${equity:.2f})"
+                        ]}
+            except Exception:
+                pass
+
         # ─── PROP FIRM CHECKS (highest priority) ────────────────
         if config.prop_firm.enabled:
             if self._prop_firm_halted:

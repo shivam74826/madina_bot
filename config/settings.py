@@ -111,7 +111,7 @@ class RiskConfig:
     max_consecutive_losses: int = 2        # Pause after just 2 losses
     pause_after_losses_minutes: int = 120  # 2 hour pause after loss streak
     max_spread_atr_pct: float = 0.08       # Very tight spread filter (8% of ATR)
-    min_tp_atr_mult: float = 1.5           # TP must be at least 1.5x ATR
+    min_tp_atr_mult: float = 0.3            # Lower for micro — SL tightener reduces distances
     max_correlated_exposure: int = 1       # Only 1 position ever
     # ─── Balance-Adaptive Mode ───────────────────────────────────
     auto_risk_scaling: bool = True          # ENABLED — $16 needs adaptive sizing
@@ -121,9 +121,9 @@ class RiskConfig:
     small_risk_per_trade: float = 0.03
     micro_max_drawdown: float = 0.25       # 25% max DD for micro
     micro_risk_reward_ratio: float = 1.5   # Still require 1:1.5
-    max_risk_at_min_lot: float = 0.15      # Accept up to 15% risk at min lot
-    micro_max_risk_at_min_lot: float = 0.15 # Same for micro — this is the reality
-    small_max_risk_at_min_lot: float = 0.10
+    max_risk_at_min_lot: float = 0.25      # Accept up to 25% risk at min lot ($4 max risk)
+    micro_max_risk_at_min_lot: float = 0.25 # Gold requires wider SLs even at min lot
+    small_max_risk_at_min_lot: float = 0.15
     min_viable_balance: float = 5.0        # Stop trading below $5
     # ─── Commission & Slippage Budget ────────────────────────────
     estimated_commission_per_lot: float = 7.0
@@ -137,7 +137,7 @@ class RiskConfig:
     # ─── Trade Cooldown ─────────────────────────────────────────
     cooldown_after_trade_minutes: int = 30     # 30 min cooldown — be very patient
     cooldown_after_loss_minutes: int = 120     # 2 hour cooldown after loss
-    daily_loss_limit_usd: float = 1.50         # Max $1.50 loss per day (~9% of $16)
+    daily_loss_limit_usd: float = 3.00         # Max $3 loss per day (~18% of $16)
 
 
 @dataclass

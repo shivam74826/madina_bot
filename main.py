@@ -621,6 +621,45 @@ class ForexAIBot:
                 signal.confidence *= 0.85  # Divergence contradicts direction
                 signal.reason += f" | {divergence_signal} contradicts"
 
+        # ─── MICRO ACCOUNT SL TIGHTENER ─────────────────────
+        # For tiny accounts: if the SL is too wide, tighten it to
+        # a max dollar risk and adjust TP to maintain the R:R ratio.
+        try:
+            equity = self.connector.get_equity()
+            max_risk_pct = config.risk.micro_max_risk_at_min_lot
+            max_risk_usd = equity * max_risk_pct  # e.g. $16 * 0.25 = $4
+            sl_dist = abs(signal.entry_price - signal.stop_loss)
+            from core.mt5_lock import mt5_safe as mt5_info
+            sym_info = mt5_info.symbol_info(symbol)
+            if sym_info and sl_dist > 0:
+                pip = sym_info.point * 10
+                sl_pips = sl_dist / pip
+                tick_val = sym_info.trade_tick_value
+                min_lot = sym_info.volume_min
+                risk_usd = sl_pips * tick_val * 10 * min_lot
+                if risk_usd > max_risk_usd and max_risk_usd > 0:
+                    # Calculate the max SL distance we can afford
+                    max_sl_pips = max_risk_usd / (tick_val * 10 * min_lot)
+                    max_sl_dist = max_sl_pips * pip
+                    original_rr = signal.risk_reward if signal.risk_reward > 0 else 1.5
+                    # Tighten SL
+                    if signal.signal_type == SignalType.BUY:
+                        signal.stop_loss = signal.entry_price - max_sl_dist
+                        signal.take_profit = signal.entry_price + (max_sl_dist * original_rr)
+                    else:
+                        signal.stop_loss = signal.entry_price + max_sl_dist
+                        signal.take_profit = signal.entry_price - (max_sl_dist * original_rr)
+                    signal.risk_reward = original_rr
+                    new_risk = max_sl_pips * tick_val * 10 * min_lot
+                    logger.info(
+                        f"{symbol} | SL TIGHTENED: ${risk_usd:.2f} -> ${new_risk:.2f} risk | "
+                        f"SL dist: {sl_dist:.2f} -> {max_sl_dist:.2f} | "
+                        f"R:R maintained at {original_rr:.1f}"
+                    )
+                    signal.reason += f" | SL tightened (${risk_usd:.0f}->${new_risk:.0f})"
+        except Exception as e:
+            logger.debug(f"SL tightener failed: {e}")
+
         # Validate through risk manager (basic checks only)
         validation = self.risk_manager.validate_trade(signal)
 
