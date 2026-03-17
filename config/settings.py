@@ -53,7 +53,9 @@ class TradingConfig:
     """Trading Parameters"""
     mode: TradingMode = TradingMode.LIVE
     symbols: List[str] = field(default_factory=lambda: [
-        "EURUSDm", "GBPUSDm", "USDJPYm", "AUDUSDm"
+        "XAUUSD", "EURUSD", "GBPUSD", "USDJPY",
+        "AUDUSD", "USDCAD", "GBPJPY", "EURJPY",
+        "BTCUSD", "US30",
     ])
     primary_timeframe: TimeFrame = TimeFrame.M15
     analysis_timeframes: List[TimeFrame] = field(default_factory=lambda: [

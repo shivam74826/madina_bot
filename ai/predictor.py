@@ -105,7 +105,6 @@ class AIPredictor:
             max_iter=500,
             random_state=42,
             solver="lbfgs",
-            multi_class="multinomial",
         )
 
         self.model = VotingClassifier(

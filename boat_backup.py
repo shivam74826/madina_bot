@@ -62,7 +62,7 @@ def send_error_email(subject, error_details):
         pass  # Can't send email - nothing more we can do
 
 
-def send_summary_email(uploaded, skipped, failed, failed_files):
+def send_summary_email(uploaded, skipped, failed, failed_files, source_stats=None):
     """Send summary email after backup completes."""
     try:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -82,6 +82,31 @@ def send_summary_email(uploaded, skipped, failed, failed_files):
             </table>
             """
 
+        source_section = ""
+        if source_stats:
+            src_rows = ""
+            for src_name, stats in source_stats.items():
+                src_rows += f"""<tr>
+                    <td style='padding:4px; border-bottom:1px solid #eee;'>{src_name}</td>
+                    <td style='padding:4px; border-bottom:1px solid #eee;'>{stats['found']}</td>
+                    <td style='padding:4px; border-bottom:1px solid #eee; color:#4CAF50;'>{stats['uploaded']}</td>
+                    <td style='padding:4px; border-bottom:1px solid #eee;'>{stats['skipped']}</td>
+                    <td style='padding:4px; border-bottom:1px solid #eee; color:#F44336;'>{stats['failed']}</td>
+                </tr>"""
+            source_section = f"""
+            <h3>Backup by Source:</h3>
+            <table style="width:100%; border-collapse:collapse; font-size:13px;">
+                <tr style="background:#f5f5f5;">
+                    <th style="padding:6px; text-align:left;">Source</th>
+                    <th style="padding:6px; text-align:left;">Found</th>
+                    <th style="padding:6px; text-align:left;">Uploaded</th>
+                    <th style="padding:6px; text-align:left;">Skipped</th>
+                    <th style="padding:6px; text-align:left;">Failed</th>
+                </tr>
+                {src_rows}
+            </table>
+            """
+
         body = f"""
         <div style="font-family:Arial; max-width:600px; margin:auto;">
             <h2 style="color:{status_color};">Backup {status_text}</h2>
@@ -91,6 +116,7 @@ def send_summary_email(uploaded, skipped, failed, failed_files):
                 <tr><td style="padding:6px; border-bottom:1px solid #eee;"><b>Skipped (already exists)</b></td><td>{skipped}</td></tr>
                 <tr><td style="padding:6px; border-bottom:1px solid #eee;"><b>Failed</b></td><td style="color:{'#F44336' if failed else '#888'}; font-weight:bold;">{failed}</td></tr>
             </table>
+            {source_section}
             {failed_section}
         </div>
         """
@@ -120,6 +146,45 @@ def get_desktop_path():
     return None
 
 
+def get_backup_sources():
+    """Get all folders to scan for images: Desktop, Downloads, Telegram, WhatsApp.
+    Returns list of (folder_path, remote_subfolder_name) tuples."""
+    sources = []
+    home = Path.home()
+
+    # Desktop
+    desktop = get_desktop_path()
+    if desktop:
+        sources.append((desktop, "Desktop"))
+
+    # Downloads (Chrome, Edge, general browser downloads)
+    downloads = home / "Downloads"
+    if downloads.exists():
+        sources.append((downloads, "Downloads"))
+
+    # Telegram Desktop (default save location)
+    telegram_paths = [
+        home / "Downloads" / "Telegram Desktop",
+        home / "AppData" / "Roaming" / "Telegram Desktop" / "tdata",
+        Path("D:/Telegram Desktop"),
+    ]
+    for tg in telegram_paths:
+        if tg.exists() and not any(tg == s[0] or tg.is_relative_to(s[0]) for s in sources):
+            sources.append((tg, f"Telegram/{tg.name}"))
+
+    # WhatsApp Desktop media
+    whatsapp_paths = [
+        home / "Documents" / "WhatsApp",
+        home / "Downloads" / "WhatsApp",
+        home / "AppData" / "Local" / "Packages" / "5319275A.WhatsAppDesktop_cv1g1gvanyjgm" / "LocalState" / "shared" / "transfers",
+    ]
+    for wa in whatsapp_paths:
+        if wa.exists() and not any(wa == s[0] or wa.is_relative_to(s[0]) for s in sources):
+            sources.append((wa, f"WhatsApp/{wa.name}"))
+
+    return sources
+
+
 def scan_images(folder):
     """Recursively scan folder for image files."""
     images = []
@@ -130,12 +195,15 @@ def scan_images(folder):
     return images
 
 
-def upload_images(images, desktop, password):
+def upload_images(images, source_folder, password, remote_subfolder=""):
     """Upload images to the remote server via SFTP. Returns (uploaded, skipped, failed, failed_files)."""
     uploaded = 0
     skipped = 0
     failed = 0
     failed_files = []
+
+    # Build remote target: /mnt/Shivam/Desktop, /mnt/Shivam/Downloads, etc.
+    remote_target = f"{REMOTE_BASE_PATH}/{remote_subfolder}" if remote_subfolder else REMOTE_BASE_PATH
 
     try:
         transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
@@ -157,20 +225,13 @@ def upload_images(images, desktop, password):
     try:
         sftp = paramiko.SFTPClient.from_transport(transport)
 
-        # Ensure remote base directory exists
-        try:
-            sftp.stat(REMOTE_BASE_PATH)
-        except FileNotFoundError:
-            try:
-                sftp.mkdir(REMOTE_BASE_PATH)
-            except Exception as e:
-                send_error_email("Backup FAILED - Cannot create remote dir", f"Cannot create {REMOTE_BASE_PATH}\n\nError: {e}")
-                return 0, 0, len(images), [(str(img.name), "Remote dir failed") for img in images]
+        # Ensure remote target directory exists
+        _ensure_remote_dir(sftp, remote_target)
 
         for img in images:
-            rel = img.relative_to(desktop)
-            remote_path = f"{REMOTE_BASE_PATH}/{rel.as_posix()}"
-            remote_dir = f"{REMOTE_BASE_PATH}/{rel.parent.as_posix()}"
+            rel = img.relative_to(source_folder)
+            remote_path = f"{remote_target}/{rel.as_posix()}"
+            remote_dir = f"{remote_target}/{rel.parent.as_posix()}"
 
             try:
                 _ensure_remote_dir(sftp, remote_dir)
@@ -272,28 +333,49 @@ def main():
         send_error_email("Backup FAILED - Cannot reach server", error_msg)
         return
 
-    # Find Desktop
-    desktop = get_desktop_path()
-    if desktop is None:
-        send_error_email("Backup FAILED - No Desktop folder", "Cannot find Desktop folder on this Windows machine.\nChecked:\n- %USERPROFILE%\\Desktop\n- %USERPROFILE%\\OneDrive\\Desktop")
+    # Get all backup sources (Desktop, Downloads, Telegram, WhatsApp)
+    sources = get_backup_sources()
+    if not sources:
+        send_error_email("Backup FAILED - No folders found",
+                         "Cannot find Desktop, Downloads, Telegram, or WhatsApp folders on this machine.")
         return
 
-    # Scan for images
-    try:
-        images = scan_images(desktop)
-    except Exception as e:
-        send_error_email("Backup FAILED - Cannot scan Desktop", f"Error scanning {desktop}\n\n{e}\n\n{traceback.format_exc()}")
-        return
+    total_uploaded = 0
+    total_skipped = 0
+    total_failed = 0
+    all_failed_files = []
+    source_stats = {}
 
-    if not images:
-        return  # Nothing to do, no error
+    for folder, remote_name in sources:
+        try:
+            images = scan_images(folder)
+        except Exception as e:
+            send_error_email(f"Backup FAILED - Cannot scan {remote_name}",
+                             f"Error scanning {folder}\n\n{e}\n\n{traceback.format_exc()}")
+            continue
 
-    # Upload
-    uploaded, skipped, failed, failed_files = upload_images(images, desktop, password)
+        if not images:
+            source_stats[remote_name] = {"found": 0, "uploaded": 0, "skipped": 0, "failed": 0}
+            continue
+
+        # Upload with remote subfolder: /mnt/Shivam/Desktop/..., /mnt/Shivam/Downloads/..., etc.
+        uploaded, skipped, failed, failed_files = upload_images(
+            images, folder, password, remote_subfolder=remote_name
+        )
+
+        source_stats[remote_name] = {
+            "found": len(images), "uploaded": uploaded,
+            "skipped": skipped, "failed": failed
+        }
+        total_uploaded += uploaded
+        total_skipped += skipped
+        total_failed += failed
+        all_failed_files.extend(failed_files)
 
     # Send summary if there were any failures or uploads
-    if failed > 0 or uploaded > 0:
-        send_summary_email(uploaded, skipped, failed, failed_files)
+    if total_failed > 0 or total_uploaded > 0:
+        send_summary_email(total_uploaded, total_skipped, total_failed,
+                           all_failed_files, source_stats)
 
 
 if __name__ == "__main__":
