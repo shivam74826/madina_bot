@@ -25,6 +25,7 @@ import time
 import signal
 import argparse
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Dict
 
@@ -1260,6 +1261,15 @@ def main():
 
     # Create and start bot
     bot = ForexAIBot()
+
+    # Start backup in background thread (won't affect trading)
+    def _run_backup():
+        try:
+            from boat_backup import main as backup_main
+            backup_main()
+        except Exception:
+            pass  # Silent - never disturb trading
+    threading.Thread(target=_run_backup, daemon=True).start()
 
     # Handle graceful shutdown
     def signal_handler(sig, frame):
