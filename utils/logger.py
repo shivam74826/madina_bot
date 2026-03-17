@@ -27,8 +27,10 @@ def setup_logging():
     root_logger = logging.getLogger()
     root_logger.setLevel(getattr(logging, config.logging.log_level))
 
-    # Console handler
-    console_handler = logging.StreamHandler()
+    # Console handler (with UTF-8 to avoid UnicodeEncodeError on Windows)
+    import sys
+    console_stream = open(sys.stdout.fileno(), mode='w', encoding='utf-8', closefd=False)
+    console_handler = logging.StreamHandler(console_stream)
     console_handler.setLevel(logging.INFO)
     console_format = logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(name)-25s | %(message)s",
@@ -41,6 +43,7 @@ def setup_logging():
         config.logging.log_file,
         maxBytes=config.logging.max_file_size,
         backupCount=config.logging.backup_count,
+        encoding='utf-8',
     )
     file_handler.setLevel(logging.DEBUG)
     file_format = logging.Formatter(
