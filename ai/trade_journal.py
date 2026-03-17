@@ -150,9 +150,9 @@ class TradingJournal:
         if total_trades > 15 and win_rate < 50:
             # Too many trades with poor win rate = overtrading
             lessons["overtrading_threshold"] = max(
-                6, lessons.get("overtrading_threshold", 8) - 1
+                2, lessons.get("overtrading_threshold", 8) - 1
             )
-            lessons["max_trades_per_day"] = max(6, total_trades // 2)
+            lessons["max_trades_per_day"] = max(2, min(total_trades // 3, 6))
 
         # ─── 3. Direction Bias ────────────────────────────────────
         dir_perf = analysis.get("direction_performance", {})
