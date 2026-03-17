@@ -442,7 +442,7 @@ class RiskManager:
         # 9. Confidence check (slightly relaxed for micro accounts)
         min_conf = config.ai.min_confidence
         if self._account_mode == "micro":
-            min_conf = max(min_conf - 0.05, 0.45)  # 0.50 instead of 0.55
+            min_conf = max(min_conf - 0.05, 0.55)  # 0.55 minimum — never go below
         if signal.confidence < min_conf:
             approved = False
             reasons.append(f"Confidence too low ({signal.confidence:.2f}, min: {min_conf})")

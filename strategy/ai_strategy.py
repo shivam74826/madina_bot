@@ -294,7 +294,7 @@ class MultiStrategyManager:
         total_strategies = len(signals)
 
         MIN_CONSENSUS = 3  # 3 out of 5 — strong consensus for real money
-        HIGH_CONFIDENCE_SOLO = 0.85  # Only allow solo at very high confidence
+        HIGH_CONFIDENCE_SOLO = 0.90  # Extremely high bar for solo override
 
         if agreement_count < MIN_CONSENSUS:
             # Check if the single strategy has very high confidence

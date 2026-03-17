@@ -516,6 +516,13 @@ class ForexAIBot:
 
         self.last_analysis_time[symbol] = now
 
+        # ─── Candle Freshness Gate ───────────────────────────────
+        # Institutional: only evaluate signals within first 3 minutes of
+        # a new M15 candle close to avoid mid-candle noise entries
+        candle_minute = now.minute % 15
+        if candle_minute > 3:
+            return  # Wait for next candle close (0-3 min window)
+
         # ─── Quick hours pre-check (log once per 10 cycles) ──
         from datetime import datetime as _dt
         utc_now = _dt.utcnow()
@@ -573,6 +580,128 @@ class ForexAIBot:
         if df is None or len(df) < 200:
             return
 
+        # ═══════════════════════════════════════════════════════════
+        #  INSTITUTIONAL-GRADE PRE-TRADE FILTERS
+        #  (What $700B firms check before every entry)
+        # ═══════════════════════════════════════════════════════════
+
+        # ─── 1. H4 Trend Alignment Gate ──────────────────────────
+        # Higher timeframe must confirm direction — never fight the H4 trend
+        h4_bias = None
+        try:
+            df_h4 = self.data_fetcher.get_ohlcv(symbol, timeframe=TimeFrame.H4, count=100)
+            if df_h4 is not None and len(df_h4) >= 50:
+                ema20_h4 = df_h4['close'].ewm(span=20).mean().iloc[-1]
+                ema50_h4 = df_h4['close'].ewm(span=50).mean().iloc[-1]
+                h4_close = df_h4['close'].iloc[-1]
+                if h4_close > ema20_h4 > ema50_h4:
+                    h4_bias = "BUY"
+                elif h4_close < ema20_h4 < ema50_h4:
+                    h4_bias = "SELL"
+                # else: h4_bias = None (choppy — no clear trend)
+        except Exception:
+            pass
+
+        # ─── 2. ADR Filter (Average Daily Range) ────────────────
+        # Don't trade if 80%+ of today's average range is consumed
+        adr_ok = True
+        try:
+            df_d1 = self.data_fetcher.get_ohlcv(symbol, timeframe=TimeFrame.D1, count=15)
+            if df_d1 is not None and len(df_d1) >= 10:
+                daily_ranges = (df_d1['high'] - df_d1['low']).iloc[-10:]
+                avg_daily_range = daily_ranges.mean()
+                today_range = df_d1['high'].iloc[-1] - df_d1['low'].iloc[-1]
+                adr_consumed = today_range / avg_daily_range if avg_daily_range > 0 else 0
+                if adr_consumed > 0.80:
+                    adr_ok = False
+                    if self.cycle_count % 10 == 0:
+                        logger.info(
+                            f"{symbol} | ADR FILTER: {adr_consumed:.0%} of daily range "
+                            f"consumed — move likely exhausted"
+                        )
+        except Exception:
+            pass
+
+        if not adr_ok:
+            return
+
+        # ─── 3. Volatility Normality Filter ─────────────────────
+        # Only trade when ATR is 0.5x-2.5x of its 20-period average
+        # Too low = no movement (spread eats profit), too high = chaotic
+        vol_normal = True
+        try:
+            if len(df) >= 30:
+                atr_series = (df['high'] - df['low']).rolling(14).mean()
+                current_atr = atr_series.iloc[-1]
+                avg_atr_20 = atr_series.iloc[-20:].mean()
+                if avg_atr_20 > 0:
+                    vol_ratio = current_atr / avg_atr_20
+                    if vol_ratio < 0.5 or vol_ratio > 2.5:
+                        vol_normal = False
+                        if self.cycle_count % 10 == 0:
+                            logger.info(
+                                f"{symbol} | VOLATILITY FILTER: ATR ratio "
+                                f"{vol_ratio:.2f}x — {'too quiet' if vol_ratio < 0.5 else 'too chaotic'}"
+                            )
+        except Exception:
+            pass
+
+        if not vol_normal:
+            return
+
+        # ─── 4. Spread Quality Check ────────────────────────────
+        # Institutional: spread must be < 20% of expected TP distance
+        spread_ok = True
+        try:
+            from core.mt5_lock import mt5_safe as _mt5_sp
+            tick = _mt5_sp.symbol_info_tick(symbol)
+            sym_info = _mt5_sp.symbol_info(symbol)
+            if tick and sym_info:
+                spread_price = tick.ask - tick.bid
+                # Expected TP distance based on ATR
+                atr_val = (df['high'] - df['low']).rolling(14).mean().iloc[-1]
+                expected_tp = atr_val * config.risk.risk_reward_ratio
+                if expected_tp > 0:
+                    spread_ratio = spread_price / expected_tp
+                    if spread_ratio > 0.20:
+                        spread_ok = False
+                        if self.cycle_count % 10 == 0:
+                            logger.info(
+                                f"{symbol} | SPREAD FILTER: Spread is "
+                                f"{spread_ratio:.0%} of expected profit — too expensive"
+                            )
+        except Exception:
+            pass
+
+        if not spread_ok:
+            return
+
+        # ─── 5. Correlation Guard ────────────────────────────────
+        # Don't open same-direction trades on correlated pairs
+        corr_ok = True
+        correlated_groups = [
+            {"EURUSDm", "GBPUSDm"},  # Both USD-denominated, highly correlated
+            {"AUDUSDm", "NZDUSDm"},  # Antipodean pairs
+        ]
+        try:
+            open_positions = self.connector.get_bot_positions()
+            for group in correlated_groups:
+                if symbol in group:
+                    for pos in open_positions:
+                        if pos["symbol"] in group and pos["symbol"] != symbol:
+                            corr_ok = False
+                            if self.cycle_count % 10 == 0:
+                                logger.info(
+                                    f"{symbol} | CORRELATION GUARD: Correlated with "
+                                    f"open {pos['symbol']} position — skip to avoid double exposure"
+                                )
+                            break
+        except Exception:
+            pass
+
+        if not corr_ok:
+            return
+
         # ─── Volume Divergence Check ─────────────────────────────
         # Reject weak moves: price trending but volume declining
         volume_ok = True
@@ -625,6 +754,47 @@ class ForexAIBot:
             if self.cycle_count % 10 == 0:
                 logger.info(f"{symbol} | No actionable signal (HOLD) — strategies see no edge")
             return
+
+        # ═══════════════════════════════════════════════════════════
+        #  INSTITUTIONAL POST-SIGNAL FILTERS
+        # ═══════════════════════════════════════════════════════════
+
+        # ─── H4 Trend Alignment Enforcement ──────────────────────
+        # Hard reject if signal opposes H4 trend (never fight the big picture)
+        if h4_bias is not None:
+            if signal.signal_type == SignalType.BUY and h4_bias == "SELL":
+                logger.info(
+                    f"{symbol} | H4 TREND BLOCK: BUY signal rejected — H4 bias is SELL "
+                    f"(price < EMA20 < EMA50)"
+                )
+                return
+            elif signal.signal_type == SignalType.SELL and h4_bias == "BUY":
+                logger.info(
+                    f"{symbol} | H4 TREND BLOCK: SELL signal rejected — H4 bias is BUY "
+                    f"(price > EMA20 > EMA50)"
+                )
+                return
+            elif signal.signal_type.value == h4_bias:
+                # H4 confirms our direction — institutional confidence boost
+                signal.confidence *= 1.08
+                signal.reason += " | H4 trend aligned"
+        else:
+            # H4 is choppy — reduce confidence (no clear HTF direction)
+            signal.confidence *= 0.90
+            signal.reason += " | H4 unclear"
+
+        # ─── Kill Zone Bonus ─────────────────────────────────────
+        # London open (7-9 UTC) and NY open (13-15 UTC) = highest probability
+        kill_zone = False
+        try:
+            from datetime import datetime as _kz_dt
+            kz_hour = _kz_dt.utcnow().hour
+            if kz_hour in (7, 8, 13, 14):
+                kill_zone = True
+                signal.confidence *= 1.05
+                signal.reason += f" | Kill zone ({kz_hour}:00 UTC)"
+        except Exception:
+            pass
 
         # ─── Journal: Direction Guard ────────────────────────
         if self.journal.should_avoid_direction(signal.signal_type.value):

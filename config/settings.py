@@ -97,7 +97,7 @@ class RiskConfig:
     max_drawdown: float = 0.25             # 25% max drawdown ($4.00) — stop trading
     default_stop_loss_pips: float = 30.0   # Tight SL
     default_take_profit_pips: float = 60.0 # 1:2 R:R
-    risk_reward_ratio: float = 1.5         # Minimum 1:1.5 R:R
+    risk_reward_ratio: float = 2.0         # Institutional minimum 1:2 R:R
     trailing_stop_pips: float = 20.0       # Tight trailing
     break_even_pips: float = 15.0          # Move to BE quickly
     trailing_stop_atr_mult: float = 1.5    # Tighter ATR trailing
@@ -110,7 +110,7 @@ class RiskConfig:
     # ─── Safety Limits ───────────────────────────────────────────
     max_consecutive_losses: int = 2        # Pause after just 2 losses
     pause_after_losses_minutes: int = 120  # 2 hour pause after loss streak
-    max_spread_atr_pct: float = 0.08       # Very tight spread filter (8% of ATR)
+    max_spread_atr_pct: float = 0.05       # Institutional spread filter (5% of ATR)
     min_tp_atr_mult: float = 0.3            # Lower for micro — SL tightener reduces distances
     max_correlated_exposure: int = 1       # Only 1 position ever
     # ─── Balance-Adaptive Mode ───────────────────────────────────
@@ -120,7 +120,7 @@ class RiskConfig:
     micro_risk_per_trade: float = 0.05     # 5% for micro
     small_risk_per_trade: float = 0.03
     micro_max_drawdown: float = 0.25       # 25% max DD for micro
-    micro_risk_reward_ratio: float = 1.5   # Still require 1:1.5
+    micro_risk_reward_ratio: float = 2.0   # Same 1:2 minimum for micro
     max_risk_at_min_lot: float = 0.25      # Accept up to 25% risk at min lot ($4 max risk)
     micro_max_risk_at_min_lot: float = 0.25 # Gold requires wider SLs even at min lot
     small_max_risk_at_min_lot: float = 0.15
@@ -166,7 +166,7 @@ class AIConfig:
     prediction_horizon: int = 24           # Predict X candles ahead
     training_lookback_days: int = 90       # Historical data for training (90 days ~1500 H1 candles)
     retrain_interval_hours: int = 168      # Retrain weekly
-    min_confidence: float = 0.55           # Higher bar for real money (need strong signals)
+    min_confidence: float = 0.60           # Institutional bar — only high-confidence signals
     feature_window: int = 50               # Lookback window for features
     use_sentiment: bool = True
     use_fundamentals: bool = True
