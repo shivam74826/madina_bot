@@ -1,0 +1,22 @@
+{
+  "current_level": 11,
+  "start_date": "2026-03-15",
+  "start_balance": 20.0,
+  "level_history": [
+    {
+      "level": 22,
+      "date": "2026-03-15T21:47:45.401142",
+      "balance": 5182.34
+    },
+    {
+      "level": 11,
+      "date": "2026-03-16T01:26:14.480196",
+      "balance": 100.0
+    }
+  ],
+  "daily_trades": 0,
+  "daily_wins": 0,
+  "daily_losses_count": 0,
+  "daily_pnl": 0.0,
+  "today_date": "2026-03-15"
+}

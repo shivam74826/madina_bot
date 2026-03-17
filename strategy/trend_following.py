@@ -44,25 +44,28 @@ class TrendFollowingStrategy(BaseStrategy):
         reasons = []
 
         # ─── Trend Direction (Moving Average Alignment) ──────────────
-        ma_aligned_bull = (
-            latest["ema_fast"] > latest["ema_slow"]
-            and latest["sma_fast"] > latest["sma_slow"]
-            and price > latest["sma_trend"]
-        )
-        ma_aligned_bear = (
-            latest["ema_fast"] < latest["ema_slow"]
-            and latest["sma_fast"] < latest["sma_slow"]
-            and price < latest["sma_trend"]
-        )
+        # Score each MA pair independently (not all-or-nothing)
+        ema_bull = latest["ema_fast"] > latest["ema_slow"]
+        sma_bull = latest["sma_fast"] > latest["sma_slow"]
+        above_sma200 = price > latest["sma_trend"]
 
-        if ma_aligned_bull:
-            score += 2
-            reasons.append("MA alignment bullish")
-        elif ma_aligned_bear:
-            score -= 2
-            reasons.append("MA alignment bearish")
-        else:
-            score += 0  # No alignment but don't block
+        ema_bear = latest["ema_fast"] < latest["ema_slow"]
+        sma_bear = latest["sma_fast"] < latest["sma_slow"]
+        below_sma200 = price < latest["sma_trend"]
+
+        # Short-term MAs (EMA + SMA) are the primary directional signal
+        if ema_bull and sma_bull:
+            score += 1
+            reasons.append("Short-term MAs bullish")
+            if above_sma200:
+                score += 1
+                reasons.append("Above SMA200 — full trend alignment")
+        elif ema_bear and sma_bear:
+            score -= 1
+            reasons.append("Short-term MAs bearish")
+            if below_sma200:
+                score -= 1
+                reasons.append("Below SMA200 — full trend alignment")
 
         # ─── Trend Strength (ADX) ───────────────────────────────
         adx_val = latest["adx"]

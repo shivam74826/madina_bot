@@ -289,22 +289,30 @@ class MultiStrategyManager:
             )
 
         # ─── Minimum Consensus Gate ──────────────────────────────────
-        # Require at least 2 strategies to agree (was 60% = 3/5 which was too strict)
+        # Require at least 2 strategies to agree, OR 1 strategy with high confidence
         agreement_count = len(aligned_signals)
         total_strategies = len(signals)
 
         MIN_CONSENSUS = 2  # 2 out of 5 — reasonable bar without signal drought
+        HIGH_CONFIDENCE_SOLO = 0.70  # Allow solo if confidence >= 0.70
+
         if agreement_count < MIN_CONSENSUS:
-            strategy_names = ", ".join(aligned_signals.keys())
-            return TradeSignal(
-                signal_type=SignalType.HOLD, symbol=symbol,
-                confidence=0, entry_price=0, stop_loss=0, take_profit=0,
-                reason=(
-                    f"Weak consensus ({agreement_count}/{total_strategies}): "
-                    f"{strategy_names} -- need {MIN_CONSENSUS}+ to trade"
-                ),
-                strategy_name="Multi_Strategy",
-            )
+            # Check if the single strategy has very high confidence
+            best_solo = max(aligned_signals.values(), key=lambda s: s.confidence)
+            if best_solo.confidence >= HIGH_CONFIDENCE_SOLO:
+                # High-confidence solo signal — let it through
+                pass
+            else:
+                strategy_names = ", ".join(aligned_signals.keys())
+                return TradeSignal(
+                    signal_type=SignalType.HOLD, symbol=symbol,
+                    confidence=0, entry_price=0, stop_loss=0, take_profit=0,
+                    reason=(
+                        f"Weak consensus ({agreement_count}/{total_strategies}): "
+                        f"{strategy_names} -- need {MIN_CONSENSUS}+ or conf>={HIGH_CONFIDENCE_SOLO}"
+                    ),
+                    strategy_name="Multi_Strategy",
+                )
 
         # ─── Select best aligned signal ──────────────────────────────
         best_name = max(

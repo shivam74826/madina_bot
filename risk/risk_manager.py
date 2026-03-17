@@ -342,6 +342,24 @@ class RiskManager:
                 approved = False
                 reasons.append(f"BLOCKED: Conflicting position on {signal.symbol} — close first")
 
+        # 3b. Hard daily trade cap — prevents overtrading even across restarts
+        try:
+            date_from = datetime.combine(date.today(), datetime.min.time())
+            date_to = datetime.now() + timedelta(hours=1)
+            from core.mt5_lock import mt5_safe as _mt5
+            deals = _mt5.history_deals_get(date_from, date_to)
+            if deals:
+                daily_entries = sum(
+                    1 for d in deals
+                    if d.magic == config.trading.magic_number and d.entry == 0
+                )
+                max_daily = 6  # Hard cap — never exceed 6 trades per day
+                if daily_entries >= max_daily:
+                    approved = False
+                    reasons.append(f"HARD CAP: {daily_entries}/{max_daily} trades today — done for the day")
+        except Exception:
+            pass  # If history query fails, rely on other guards
+
         # 4. Daily loss limit
         if self._is_daily_loss_exceeded():
             approved = False
@@ -389,6 +407,12 @@ class RiskManager:
         if not self._is_optimal_session(signal.symbol):
             approved = False
             reasons.append("Outside optimal trading session for this instrument")
+
+        # 8c. Trade cooldown — prevent rapid-fire trades on same symbol
+        cooldown_ok, cooldown_reason = self._check_trade_cooldown(signal.symbol)
+        if not cooldown_ok:
+            approved = False
+            reasons.append(cooldown_reason)
 
         # 9. Confidence check (slightly relaxed for micro accounts)
         min_conf = config.ai.min_confidence
@@ -523,8 +547,11 @@ class RiskManager:
             )
             base = actual_min_lot
 
-        # Clamp to limits
-        base = max(actual_min_lot, min(base, config.risk.max_lot_size))
+        # Clamp to limits (use stricter of risk config and prop firm config)
+        max_lot = config.risk.max_lot_size
+        if config.prop_firm.enabled:
+            max_lot = min(max_lot, config.prop_firm.max_lot_size)
+        base = max(actual_min_lot, min(base, max_lot))
 
         # Round to volume step (floor to avoid oversizing)
         if sym_info:
@@ -533,6 +560,10 @@ class RiskManager:
             base = math.floor(base / step) * step
 
         return round(base, 2)
+
+    def record_trade_opened(self, symbol: str):
+        """Record that a trade was just opened — starts the cooldown timer."""
+        self._last_trade_time[symbol] = datetime.now()
 
     def record_trade_result(self, profit: float, symbol: str = "", strategy: str = ""):
         """Track consecutive wins/losses for position sizing and circuit breaker."""
@@ -947,7 +978,7 @@ class RiskManager:
     # ─── Daily Risk Tracking ─────────────────────────────────────────────
 
     def _is_daily_loss_exceeded(self) -> bool:
-        """Check if daily loss limit has been hit."""
+        """Check if daily loss limit has been hit (% or USD)."""
         deals = self.connector.get_history_deals(days=1)
         daily_pl = sum(d["profit"] + d.get("swap", 0) + d.get("commission", 0)
                        for d in deals if d.get("magic") == config.trading.magic_number)
@@ -958,6 +989,12 @@ class RiskManager:
         total_daily = daily_pl + unrealized
         balance = self.connector.get_balance()
         max_daily_loss = balance * config.risk.max_daily_risk
+
+        # Hard USD daily loss limit
+        usd_limit = getattr(config.risk, 'daily_loss_limit_usd', 0)
+        if usd_limit > 0 and total_daily < -usd_limit:
+            logger.warning(f"DAILY USD LOSS LIMIT: {total_daily:.2f} / -${usd_limit:.0f} — stopping trades")
+            return True
 
         if total_daily < -max_daily_loss:
             logger.warning(f"Daily loss limit reached: {total_daily:.2f} / -{max_daily_loss:.2f}")

@@ -109,6 +109,32 @@ class ForexAIBot:
         # Daily trade counter (reset each UTC day)
         self._trades_today = 0
         self._trade_count_date = None
+        self._sync_trade_count()  # Restore count from MT5 history on startup
+
+    def _sync_trade_count(self):
+        """Count today's bot trades from MT5 deal history — survives restarts."""
+        try:
+            from datetime import datetime as _dt, timedelta
+            from core.mt5_lock import mt5_safe as mt5
+            utc_today = _dt.utcnow().date()
+            date_from = _dt(utc_today.year, utc_today.month, utc_today.day)
+            date_to = _dt.utcnow() + timedelta(hours=1)
+            deals = mt5.history_deals_get(date_from, date_to)
+            if deals:
+                # Count entry deals (type 0=BUY, 1=SELL) with our magic number
+                count = sum(
+                    1 for d in deals
+                    if d.magic == config.trading.magic_number
+                    and d.entry == 0  # 0 = market entry (not exit)
+                )
+                self._trades_today = count
+                self._trade_count_date = utc_today
+                logger.info(f"Trade count synced from MT5: {count} trades today")
+            else:
+                self._trade_count_date = utc_today
+        except Exception as e:
+            logger.warning(f"Failed to sync trade count: {e}")
+            self._trade_count_date = _dt.utcnow().date()
 
     def start(self, with_dashboard: bool = True):
         """Start the trading bot."""
@@ -129,6 +155,9 @@ class ForexAIBot:
             logger.info("Set your credentials in environment variables:")
             logger.info("  MT5_LOGIN, MT5_PASSWORD, MT5_SERVER")
             return False
+
+        # ─── Auto-enable AutoTrading if disabled ─────────────────
+        self._ensure_autotrading()
 
         # Initialize risk manager
         self.risk_manager.initialize()
@@ -181,6 +210,60 @@ class ForexAIBot:
         self._trading_loop()
 
         return True
+
+    def _ensure_autotrading(self):
+        """Check if AutoTrading is enabled in MT5; try to enable it if not."""
+        try:
+            from core.mt5_lock import mt5_safe as mt5
+            info = mt5.terminal_info()
+            if info and info.trade_allowed:
+                logger.info("AutoTrading: ENABLED")
+                return
+            logger.warning("AutoTrading is DISABLED in MT5 — attempting to enable via Ctrl+E...")
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+
+            def find_mt5_hwnd():
+                result = [None]
+                def cb(hwnd, _):
+                    length = user32.GetWindowTextLengthW(hwnd)
+                    if length > 0:
+                        buf = ctypes.create_unicode_buffer(length + 1)
+                        user32.GetWindowTextW(hwnd, buf, length + 1)
+                        if 'MetaTrader' in buf.value or 'Exness' in buf.value:
+                            if user32.IsWindowVisible(hwnd):
+                                result[0] = hwnd
+                    return True
+                WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+                user32.EnumWindows(WNDENUMPROC(cb), 0)
+                return result[0]
+
+            hwnd = find_mt5_hwnd()
+            if not hwnd:
+                logger.error("Could not find MT5 window — enable AutoTrading manually (Ctrl+E)")
+                return
+            user32.ShowWindow(hwnd, 9)
+            import time as _t; _t.sleep(0.3)
+            user32.SetForegroundWindow(hwnd)
+            _t.sleep(0.5)
+            try:
+                import pyautogui
+                pyautogui.hotkey('ctrl', 'e')
+            except ImportError:
+                user32.keybd_event(0x11, 0, 0, 0)
+                user32.keybd_event(0x45, 0, 0, 0)
+                _t.sleep(0.05)
+                user32.keybd_event(0x45, 0, 2, 0)
+                user32.keybd_event(0x11, 0, 2, 0)
+            _t.sleep(1.5)
+            info = mt5.terminal_info()
+            if info and info.trade_allowed:
+                logger.info("AutoTrading: ENABLED (auto-toggled)")
+            else:
+                logger.error("AutoTrading still DISABLED — please enable manually in MT5 (Ctrl+E)")
+        except Exception as e:
+            logger.error(f"AutoTrading check failed: {e}")
 
     def stop(self):
         """Gracefully stop the bot."""
@@ -254,6 +337,8 @@ class ForexAIBot:
                 if self._trade_count_date != utc_today:
                     self._trades_today = 0
                     self._trade_count_date = utc_today
+                    # Re-sync from MT5 in case of race condition
+                    self._sync_trade_count()
                     # Run daily analysis for the previous day
                     if self.cycle_count > 1:
                         try:
@@ -584,8 +669,10 @@ class ForexAIBot:
             market_regime, volume_ok, divergence_signal
         )
 
-        # ─── Live Price Validation ───────────────────────────────
-        # Reject if market price drifted too far from signal's expected entry
+        # ─── Live Price Adjustment ────────────────────────────────
+        # Market orders fill at live price, not the OHLCV close used by strategies.
+        # Adjust entry/SL/TP to live price. Only reject if drift is extreme
+        # (>2x ATR = data is fundamentally broken or market gap).
         if config.trading.mode != TradingMode.PAPER:
             try:
                 from core.mt5_lock import mt5_safe as mt5
@@ -593,16 +680,22 @@ class ForexAIBot:
                 if tick and signal.entry_price > 0:
                     live_price = tick.ask if signal.signal_type == SignalType.BUY else tick.bid
                     drift = abs(live_price - signal.entry_price)
-                    # Use ATR from the data to gauge acceptable drift
                     atr_vals = (df['high'].iloc[-14:] - df['low'].iloc[-14:]).mean()
-                    max_drift = atr_vals * 0.3
+                    max_drift = atr_vals * 2.0  # Only reject extreme gaps
+
                     if drift > max_drift:
                         logger.warning(
                             f"{symbol} | PRICE DRIFT: Live {live_price:.2f} vs "
                             f"signal {signal.entry_price:.2f} (drift {drift:.2f} > "
-                            f"max {max_drift:.2f}) -- stale signal, skipping"
+                            f"max {max_drift:.2f}) -- extreme gap, skipping"
                         )
                         return
+
+                    # Shift entry, SL, TP to live price
+                    price_shift = live_price - signal.entry_price
+                    signal.entry_price = live_price
+                    signal.stop_loss += price_shift
+                    signal.take_profit += price_shift
             except Exception:
                 pass  # Proceed if tick fetch fails
 
@@ -634,6 +727,8 @@ class ForexAIBot:
 
             if result:
                 self._trades_today += 1
+                # Record trade opened for cooldown tracking
+                self.risk_manager.record_trade_opened(symbol)
                 # Record signal for dedup tracking
                 self.live_manager.record_signal(
                     symbol, signal.signal_type.value,

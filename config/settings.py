@@ -62,7 +62,7 @@ class TradingConfig:
     max_open_trades: int = 2                    # 2 max for prop firm (limit exposure)
     max_trades_per_symbol: int = 2              # Allow 2 trades on same symbol (needed when trading single instrument)
     trading_hours_start: int = 1   # UTC hour (London session start)
-    trading_hours_end: int = 22    # UTC hour
+    trading_hours_end: int = 23    # UTC hour (extended to 11 PM UTC)
     magic_number: int = 123456     # Unique ID for bot's orders
 
 
@@ -88,7 +88,7 @@ class PropFirmConfig:
     allow_news_trading: bool = True            # Goat Funded allows news trading
     max_risk_per_trade: float = 0.0075         # 0.75% per trade (conservative for challenge)
     max_open_trades: int = 2                   # Limit total exposure
-    max_lot_size: float = 0.50                 # Max lot cap for $5K
+    max_lot_size: float = 0.02                 # Max lot cap — limit per-trade damage
     # ─── Emergency Shutdown ──────────────────────────────────────
     emergency_close_at_dd_pct: float = 0.065   # Close ALL trades if DD hits 6.5%
     pause_at_daily_dd_pct: float = 0.025       # Pause after 2.5% daily loss
@@ -108,13 +108,13 @@ class RiskConfig:
     trailing_stop_atr_mult: float = 2.0    # Trailing distance = ATR * this (wider to let winners run)
     break_even_atr_mult: float = 1.5       # Move to BE after ATR * 1.5 in profit (avoid noise stops)
     use_atr_trailing: bool = True          # Use ATR-based (True) or fixed pips (False)
-    max_lot_size: float = 0.50             # Capped for prop firm $5K
+    max_lot_size: float = 0.02             # Capped to limit per-trade damage
     min_lot_size: float = 0.01
     use_trailing_stop: bool = True
     use_break_even: bool = True
     # ─── Safety Limits ───────────────────────────────────────────
-    max_consecutive_losses: int = 5        # Pause after 5 losses (allow more attempts)
-    pause_after_losses_minutes: int = 120  # 2 hour pause after loss streak
+    max_consecutive_losses: int = 3        # Pause after 3 losses (prevent spiral)
+    pause_after_losses_minutes: int = 60   # 1 hour pause after loss streak
     max_spread_atr_pct: float = 0.10       # Tighter spread filter (10% of ATR)
     min_tp_atr_mult: float = 1.5           # TP must be at least 1.5x ATR away
     max_correlated_exposure: int = 1       # Only 1 position in correlated instruments
@@ -140,17 +140,19 @@ class RiskConfig:
     scaling_proven_factor: float = 0.50
     scaling_full_after_trades: int = 150
     # ─── Trade Cooldown ─────────────────────────────────────────
-    cooldown_after_trade_minutes: int = 5      # 5 min cooldown (prevent overtrading)
-    cooldown_after_loss_minutes: int = 30      # 30 min cooldown after loss
+    cooldown_after_trade_minutes: int = 15     # 15 min cooldown (prevent overtrading)
+    cooldown_after_loss_minutes: int = 60      # 60 min cooldown after loss
+    daily_loss_limit_usd: float = 75.0         # Conservative daily loss cap (~1.5% of $5K)
 
 
 @dataclass
 class SessionConfig:
     """Trading Session Windows (UTC hours) — high-probability windows only"""
-    # Gold (XAUUSD) optimal sessions: London open + US session
+    # Gold (XAUUSD) optimal sessions: Asian + London + US session
     gold_sessions: list = field(default_factory=lambda: [
+        {"name": "Asian", "start": 0, "end": 7},
         {"name": "London", "start": 7, "end": 12},
-        {"name": "US_Session", "start": 12, "end": 21},
+        {"name": "US_Session", "start": 12, "end": 23},
     ])
     # Forex major pairs
     forex_sessions: list = field(default_factory=lambda: [
