@@ -50,6 +50,7 @@ from dashboard.app import Dashboard
 from utils.logger import setup_logging, TradeLogger
 from ai.trade_journal import TradingJournal
 from core.live_trade_manager import LiveTradeManager, C
+from utils.email_notifier import EmailNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,9 @@ class ForexAIBot:
 
         # Learning system — reads past lessons and records new ones
         self.journal = TradingJournal()
+
+        # Email notifications
+        self.email_notifier = EmailNotifier()
 
         # Dashboard (initialized later)
         self.dashboard = None
@@ -465,11 +469,36 @@ class ForexAIBot:
                                 profit, symbol=deal_symbol, strategy=strategy_name
                             )
                             result = "WIN" if profit > 0 else "LOSS"
+                            color = C.GREEN if profit > 0 else C.RED
+                            equity_after = self.connector.get_equity()
+                            # ─── Prominent WIN/LOSS Display ──────────
+                            logger.info("")
+                            logger.info(f"{'='*50}")
                             logger.info(
-                                f"Position closed: {result} {profit:+.2f} | "
-                                f"{deal_symbol} | {strategy_name} | "
+                                f"  {color}{C.BOLD}TRADE {result}: ${profit:+.2f}{C.RESET}"
+                            )
+                            logger.info(
+                                f"  Symbol: {deal_symbol} | Strategy: {strategy_name}"
+                            )
+                            logger.info(
+                                f"  Balance after: ${equity_after:.2f} | "
                                 f"Consecutive losses: {self.risk_manager._consecutive_losses}"
                             )
+                            logger.info(f"{'='*50}")
+                            logger.info("")
+                            # ─── Email notification ──────────────────
+                            try:
+                                direction = "BUY" if deal.get("type", 0) == 0 else "SELL"
+                                self.email_notifier.notify_trade_closed(
+                                    symbol=deal_symbol,
+                                    direction=direction,
+                                    ticket=deal.get("ticket", 0),
+                                    profit=profit,
+                                    close_price=deal.get("price", 0),
+                                    comment=f"{result} | {strategy_name} | Balance: ${equity_after:.2f}"
+                                )
+                            except Exception:
+                                pass
 
             # Update tracked set
             self._tracked_tickets = current_tickets

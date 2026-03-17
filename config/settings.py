@@ -53,7 +53,7 @@ class TradingConfig:
     """Trading Parameters"""
     mode: TradingMode = TradingMode.LIVE
     symbols: List[str] = field(default_factory=lambda: [
-        "XAUUSDm"
+        "EURUSDm", "GBPUSDm", "USDJPYm", "AUDUSDm"
     ])
     primary_timeframe: TimeFrame = TimeFrame.M15
     analysis_timeframes: List[TimeFrame] = field(default_factory=lambda: [
@@ -145,8 +145,8 @@ class SessionConfig:
     """Trading Session Windows (UTC hours) — high-probability windows only"""
     # Gold (XAUUSD) optimal sessions: London + early US only (best liquidity)
     gold_sessions: list = field(default_factory=lambda: [
-        {"name": "London", "start": 7, "end": 12},
-        {"name": "US_Session", "start": 12, "end": 20},
+        {"name": "London", "start": 7, "end": 16},
+        {"name": "US_Session", "start": 13, "end": 20},
     ])
     # Forex major pairs
     forex_sessions: list = field(default_factory=lambda: [

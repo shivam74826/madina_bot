@@ -248,9 +248,12 @@ class RiskManager:
         risk_pct_at_min_lot = risk_at_min_lot / equity if equity > 0 else 1.0
 
         effective_max_risk = self._get_effective_max_risk_at_min_lot()
+        # SL tightener will clamp SL to affordable level at trade time,
+        # so viability only requires margin to be affordable
+        has_sl_tightener = self._account_mode == "micro"
         viable = (
             margin_for_min < equity * 0.5 and  # Margin < 50% of equity
-            risk_pct_at_min_lot < effective_max_risk  # Risk < adaptive cap
+            (has_sl_tightener or risk_pct_at_min_lot < effective_max_risk)
         )
 
         return {

@@ -337,6 +337,7 @@ class MT5Connector:
             result.append({
                 "ticket": deal.ticket,
                 "order": deal.order,
+                "position_id": deal.position_id,
                 "symbol": deal.symbol,
                 "type": deal.type,
                 "volume": deal.volume,
