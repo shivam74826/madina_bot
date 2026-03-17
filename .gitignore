@@ -10,6 +10,7 @@ models/
 .venv/
 venv/
 env/
+.setup_done
 *.egg-info/
 dist/
 build/

