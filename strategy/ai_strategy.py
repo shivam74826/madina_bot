@@ -289,12 +289,12 @@ class MultiStrategyManager:
             )
 
         # ─── Minimum Consensus Gate ──────────────────────────────────
-        # Require at least 2 strategies to agree, OR 1 strategy with high confidence
+        # Require at least 3 strategies to agree for real money safety
         agreement_count = len(aligned_signals)
         total_strategies = len(signals)
 
-        MIN_CONSENSUS = 2  # 2 out of 5 — reasonable bar without signal drought
-        HIGH_CONFIDENCE_SOLO = 0.70  # Allow solo if confidence >= 0.70
+        MIN_CONSENSUS = 3  # 3 out of 5 — strong consensus for real money
+        HIGH_CONFIDENCE_SOLO = 0.85  # Only allow solo at very high confidence
 
         if agreement_count < MIN_CONSENSUS:
             # Check if the single strategy has very high confidence

@@ -353,7 +353,7 @@ class RiskManager:
                     1 for d in deals
                     if d.magic == config.trading.magic_number and d.entry == 0
                 )
-                max_daily = 6  # Hard cap — never exceed 6 trades per day
+                max_daily = 3  # Hard cap — max 3 trades per day
                 if daily_entries >= max_daily:
                     approved = False
                     reasons.append(f"HARD CAP: {daily_entries}/{max_daily} trades today — done for the day")
